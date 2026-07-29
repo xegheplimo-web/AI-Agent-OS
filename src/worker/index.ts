@@ -35,6 +35,7 @@ async function main() {
     const res = await pool.query(
       `UPDATE jobs
          SET status='running', locked_by=$1, worker=$1,
+             lease_token=gen_random_uuid(),
              heartbeat_at=now(), started_at=coalesce(started_at, now()),
              attempt=attempt+1, updated_at=now()
        WHERE id IN (
@@ -44,13 +45,13 @@ async function main() {
           FOR UPDATE SKIP LOCKED
           LIMIT 1
        )
-       RETURNING id, type, target`,
+       RETURNING id, type, target, audit_id, lease_token`,
       [workerId],
     );
     for (const row of res.rows as Array<{ type: string; target: string }>) {
       console.log(`[worker] claimed ${row.type} → ${row.target}`);
     }
-    return res.rows as Array<{ id: string; type: string; target: string }>;
+    return res.rows as Array<{ id: string; type: string; target: string; audit_id: string | null; lease_token: string }>;
   };
 
   let beats = 0;
@@ -91,10 +92,22 @@ async function main() {
 
   const shutdown = async () => {
     clearInterval(timer);
-    /* release anything still locked so another worker resumes immediately */
+    /* Wait for the current tick to finish before releasing jobs — releasing
+       mid-execution would let another worker claim and re-run a job whose
+       executor is still writing. The stale supervisor (45s) is the safety net
+       if the tick hangs. */
+    const deadline = Date.now() + 60_000;
+    while (busy && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    if (busy) {
+      console.log("[worker] tick still running after 60s — releasing jobs; stale supervisor will recover");
+    }
+    /* release anything still locked so another worker resumes immediately.
+       Clear lease_token so a fencing check by the old worker is a no-op. */
     try {
       await pool.query(
-        `UPDATE jobs SET status='queued', locked_by=NULL, worker=NULL, updated_at=now()
+        `UPDATE jobs SET status='queued', locked_by=NULL, worker=NULL, lease_token=NULL, updated_at=now()
           WHERE status='running' AND locked_by=$1`,
         [workerId],
       );

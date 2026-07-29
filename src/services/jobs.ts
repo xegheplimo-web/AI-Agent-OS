@@ -97,22 +97,42 @@ export async function advanceJobsOnce(workerId?: string): Promise<void> {
     if (!isDemoMode && hasExecutor(job.type)) {
       try {
         await runExecutor(job);
-        await db
+        /* Lease fencing: only mark completed if we still own the job. If the
+           stale supervisor requeued it (clearing lease_token) and another
+           worker claimed it, this update is a no-op — we lost ownership
+           during the executor run. */
+        const leaseFilter = job.leaseToken
+          ? and(eq(jobs.id, job.id), eq(jobs.leaseToken, job.leaseToken))
+          : eq(jobs.id, job.id);
+        const finalized = await db
           .update(jobs)
           .set({ status: "completed", progress: 100, finishedAt: new Date(), heartbeatAt: new Date(), updatedAt: new Date() })
-          .where(eq(jobs.id, job.id));
-        await db.insert(events).values({
-          type: "job.completed",
-          severity: "success",
-          source: job.worker ?? job.lockedBy ?? "worker",
-          message: `${job.type} finished for ${job.target} (real executor)`,
-        });
+          .where(leaseFilter)
+          .returning({ id: jobs.id });
+        if (job.leaseToken && !finalized.length) {
+          await db.insert(events).values({
+            type: "job.requeued",
+            severity: "warning",
+            source: job.worker ?? job.lockedBy ?? "worker",
+            message: `${job.type} for ${job.target}: lease lost during executor — another worker owns this job now`,
+          });
+        } else {
+          await db.insert(events).values({
+            type: "job.completed",
+            severity: "success",
+            source: job.worker ?? job.lockedBy ?? "worker",
+            message: `${job.type} finished for ${job.target} (real executor)`,
+          });
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        const leaseFilter = job.leaseToken
+          ? and(eq(jobs.id, job.id), eq(jobs.leaseToken, job.leaseToken))
+          : eq(jobs.id, job.id);
         await db
           .update(jobs)
           .set({ status: "failed", finishedAt: new Date(), heartbeatAt: new Date(), updatedAt: new Date(), errorMessage: message })
-          .where(eq(jobs.id, job.id));
+          .where(leaseFilter);
         await db.insert(events).values({
           type: "job.failed",
           severity: "error",
@@ -178,6 +198,7 @@ export async function requeueStaleJobs(): Promise<number> {
             error_message='Worker heartbeat lost after '
               || round(extract(epoch from (now() - coalesce(heartbeat_at, created_at)))::numeric)
               || 's',
+            lease_token=NULL,
             updated_at=now()
       WHERE status='running'
         AND locked_by IS DISTINCT FROM 'inline-demo'
@@ -190,7 +211,7 @@ export async function requeueStaleJobs(): Promise<number> {
   /* --- attempts remain → back to `queued` for another worker --- */
   const requeued = await pool.query(
     `UPDATE jobs
-        SET status='queued', locked_by=NULL, worker=NULL, progress=0, updated_at=now()
+        SET status='queued', locked_by=NULL, worker=NULL, lease_token=NULL, progress=0, updated_at=now()
       WHERE status='running'
         AND locked_by IS DISTINCT FROM 'inline-demo'
         AND coalesce(heartbeat_at, created_at) < now() - ($1 || ' seconds')::interval

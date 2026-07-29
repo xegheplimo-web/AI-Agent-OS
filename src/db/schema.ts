@@ -196,6 +196,13 @@ export const jobs = pgTable("jobs", {
   maxAttempts: integer("max_attempts").notNull().default(3),
   worker: text("worker"),
   lockedBy: text("locked_by"),
+  /** Fencing token set on claim. Every state transition (heartbeat, finalize,
+   *  progress) must include `WHERE lease_token = $token` — if a stale
+   *  supervisor requeued the job (clearing lease_token), the update matches 0
+   *  rows and the worker knows it lost ownership. Without this, a worker that
+   *  crashed and was requeued could still finalize a job another worker has
+   *  already claimed and is executing. */
+  leaseToken: uuid("lease_token"),
   heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }),
   startedAt: timestamp("started_at", { withTimezone: true }),
   finishedAt: timestamp("finished_at", { withTimezone: true }),

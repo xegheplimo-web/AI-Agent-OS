@@ -147,10 +147,15 @@ describe("parity derived from real inventory", () => {
     findings: [],
   };
 
-  it("passes when authz is complete and latency is under threshold", () => {
+  it("passes authz and latency when both are good, but overall is warning due to unmeasured checks", () => {
     const checks = parityChecksFrom(baseInv, 120);
     expect(checks.find((c) => c.key === "endpoint_authz")?.status).toBe("passed");
-    expect(computeParityScore(checks).overallStatus).toBe("passed");
+    expect(checks.find((c) => c.key === "p95_latency")?.status).toBe("passed");
+    /* golden_tests, port_map, ui_critical_paths are pending (not measured by
+       the auditor), so the overall status cannot be "passed" — that is the
+       honest behavior, not a false-green. */
+    const { overallStatus } = computeParityScore(checks);
+    expect(overallStatus).toBe("warning");
   });
 
   it("fails the authz check when a mutating route is unguarded", () => {

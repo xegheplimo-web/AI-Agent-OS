@@ -190,16 +190,25 @@ export function parityChecksFrom(inv: NormalizedInventory, latencyP95: number | 
     {
       key: "golden_tests",
       label: "golden tests",
-      baselineValue: "vitest suite",
-      currentValue: "unit suite present",
-      status: "passed" as const,
+      baselineValue: "vitest suite passing",
+      currentValue: "not measured by auditor",
+      /* Previously hard-coded "passed" without reading test results. The
+         auditor does not run the test suite, so it cannot claim this check
+         passed — that was a false-green. Marked pending until a real test
+         runner integration exists. */
+      status: "pending" as const,
+      difference: "auditor does not execute the test suite — no evidence",
     },
     {
       key: "service_inventory",
       label: "service inventory",
-      baselineValue: `${routeCount} routes`,
-      currentValue: `${routeCount} routes`,
+      baselineValue: `${routeCount} routes discovered`,
+      currentValue: `${routeCount} routes discovered`,
+      /* Both baseline and current come from the same scan, so this check
+         only verifies that routes were found — it is not a real parity
+         comparison against a known-good baseline. */
       status: (routeCount > 0 ? "passed" : "failed") as "passed" | "failed",
+      ...(routeCount === 0 ? { difference: "no routes discovered" } : {}),
     },
     {
       key: "env_contract",
@@ -213,8 +222,13 @@ export function parityChecksFrom(inv: NormalizedInventory, latencyP95: number | 
       key: "port_map",
       label: "port map",
       baselineValue: "3000/5432",
-      currentValue: `${process.env.PORT ?? 3000}/5432`,
-      status: "passed" as const,
+      currentValue: "not measured",
+      /* Previously hard-coded "passed" by reading process.env.PORT — that
+         only checks the auditor's own env, not the target system's actual
+         listening ports. Without a real port scan or Docker inspect, this
+         is an unknown. */
+      status: "pending" as const,
+      difference: "no port scan performed — auditor reads its own env, not the target's listening ports",
     },
     {
       key: "db_schema",
@@ -229,14 +243,18 @@ export function parityChecksFrom(inv: NormalizedInventory, latencyP95: number | 
     {
       key: "ui_critical_paths",
       label: "UI critical paths",
-      baselineValue: "7 pages",
-      currentValue: "7 pages",
-      status: "passed" as const,
+      baselineValue: "not measured",
+      currentValue: "not measured",
+      /* Previously hard-coded "passed" with both baseline and current set to
+         "7 pages" — a tautology, not a measurement. The auditor does not
+         run Playwright or any UI test, so it has no evidence. */
+      status: "pending" as const,
+      difference: "no UI test runner — auditor cannot verify critical paths",
     },
     {
       key: "endpoint_authz",
       label: "endpoint authorization",
-      baselineValue: `${mutating} mutating guarded`,
+      baselineValue: `${mutating} mutating endpoints`,
       currentValue: `${guarded} guarded`,
       status: (unguardedMutating === 0 ? "passed" : "failed") as "passed" | "failed",
       ...(unguardedMutating ? { difference: `${unguardedMutating} unguarded` } : {}),
