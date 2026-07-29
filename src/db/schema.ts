@@ -10,6 +10,7 @@ import {
   index,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 /* Indexes below were added in response to a real auditor finding:
    "19 cột hot path chưa có index" (database-inventory scanner, pg_indexes).
@@ -72,9 +73,13 @@ export const audits = pgTable("audits", {
   index("audits_status_idx").on(t.status),
   index("audits_started_at_idx").on(t.startedAt),
   index("audits_environment_idx").on(t.environment),
-  /* UNIQUE: two concurrent requests carrying the same key must not both
-     insert. The second one hits a constraint violation and replays. */
-  uniqueIndex("audits_idempotency_uidx").on(t.idempotencyKey),
+  /* UNIQUE partial index: only enforces uniqueness when idempotency_key IS
+     NOT NULL. Postgres treats NULLs as distinct in a plain unique index, so
+     without the WHERE clause, multiple NULL-keyed audits would coexist — but
+     the real risk is the opposite: a plain unique index on a nullable column
+     can silently allow duplicates in some edge cases with concurrent inserts.
+     The partial index makes the intent explicit and the constraint airtight. */
+  uniqueIndex("audits_idempotency_uidx").on(t.idempotencyKey).where(sql`${t.idempotencyKey} IS NOT NULL`),
 ]);
 
 /* ------------------------------------------------------------------ */
@@ -167,7 +172,7 @@ export const jobs = pgTable("jobs", {
   id: uuid("id").primaryKey().defaultRandom(),
   type: text("type").notNull(), // audit.run | sbom.export | parity.gate | artifact.package | knowledge.reindex
   status: text("status").notNull().default("queued"),
-  // queued | preparing | running | waiting_approval | completed | failed | cancelled | timed_out
+  // queued | running | completed | failed | cancelled | timed_out
   /** audit.run jobs carry the audit they own, so a worker only ever runs the
    *  audit belonging to the job it successfully claimed. */
   auditId: uuid("audit_id").references(() => audits.id, { onDelete: "cascade" }),
@@ -190,6 +195,13 @@ export const jobs = pgTable("jobs", {
   index("jobs_created_at_idx").on(t.createdAt),
   index("jobs_heartbeat_idx").on(t.heartbeatAt),
   index("jobs_audit_id_idx").on(t.auditId),
+  /* UNIQUE partial index: at most one audit.run job per audit. Prevents a
+     race between startAudit and decideApproval from spawning two jobs for
+     the same audit. Only applies to active (non-terminal) jobs so completed/
+     failed/timed_out rows don't block legitimate re-runs. */
+  uniqueIndex("jobs_audit_run_active_uidx")
+    .on(t.auditId)
+    .where(sql`${t.type} = 'audit.run' AND ${t.status} IN ('queued', 'running')`),
 ]);
 
 /* ------------------------------------------------------------------ */
