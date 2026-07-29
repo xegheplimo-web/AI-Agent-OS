@@ -38,7 +38,7 @@ export function LifecyclePipeline() {
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: api.jobs, refetchInterval: 4000 });
 
   const approvals = useQuery({ queryKey: ["approvals"], queryFn: () => api.approvals(), refetchInterval: 6000 });
-  const pushApproval = approvals.data?.find((a) => a.actionType === "artifact.push" && a.status === "pending");
+  const pushApproval = approvals.data?.find((a) => a.actionType === "artifact.package" && a.status === "pending");
 
   const latest = audits.data?.[0];
   const auditRunning = latest?.status === "running";

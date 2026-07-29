@@ -5,12 +5,17 @@ import type { Actor } from "@/lib/auth";
 import { logAudit } from "@/lib/audit-log";
 import { jobDtoSchema, type JobDTO } from "@/lib/contracts";
 import { isDemoMode } from "@/services/mode";
+import { hasExecutor, runExecutor } from "@/services/executors";
 
 /* ------------------------------------------------------------------ */
 /* Job service — DB-backed queue. Demo mode advances jobs inline; in   */
 /* production the external worker (src/worker/index.ts) claims them.   */
 /* ------------------------------------------------------------------ */
 
+/* Demo-mode pacing only. In production the executor runs synchronously and
+ * the job completes when the executor returns (or fails). The durations are
+ * kept so a demo deployment still shows the staged-progress timeline without
+ * running the real (potentially slow) scanners on every API request. */
 const JOB_DURATION_MS: Record<string, number> = {
   "sbom.export": 6000,
   "parity.gate": 9000,
@@ -83,6 +88,44 @@ export async function advanceJobsOnce(workerId?: string): Promise<void> {
   const now = Date.now();
   for (const job of active) {
     if (job.type === "audit.run") continue; // audit pipeline owns its own completion
+
+    /* Production: run the real executor. The job was claimed by a worker, so
+     * this is the worker's tick — it runs the executor synchronously and
+     * marks the job completed/failed based on the outcome. There is no
+     * wall-clock simulation in production: a job that has no executor is a
+     * configuration error, not a "slow" job. */
+    if (!isDemoMode && hasExecutor(job.type)) {
+      try {
+        await runExecutor(job);
+        await db
+          .update(jobs)
+          .set({ status: "completed", progress: 100, finishedAt: new Date(), heartbeatAt: new Date(), updatedAt: new Date() })
+          .where(eq(jobs.id, job.id));
+        await db.insert(events).values({
+          type: "job.completed",
+          severity: "success",
+          source: job.worker ?? job.lockedBy ?? "worker",
+          message: `${job.type} finished for ${job.target} (real executor)`,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        await db
+          .update(jobs)
+          .set({ status: "failed", finishedAt: new Date(), heartbeatAt: new Date(), updatedAt: new Date(), errorMessage: message })
+          .where(eq(jobs.id, job.id));
+        await db.insert(events).values({
+          type: "job.failed",
+          severity: "error",
+          source: job.worker ?? job.lockedBy ?? "worker",
+          message: `${job.type} failed for ${job.target}: ${message}`,
+        });
+      }
+      continue;
+    }
+
+    /* Demo mode (or a job type with no executor yet): staged wall-clock
+     * progress so the dashboard shows a timeline without running the real
+     * (slow) scanners on every API request. */
     const duration = JOB_DURATION_MS[job.type] ?? 8000;
     const startMs = new Date(job.startedAt ?? job.createdAt).getTime();
     const elapsed = now - startMs;
@@ -96,7 +139,7 @@ export async function advanceJobsOnce(workerId?: string): Promise<void> {
         type: "job.completed",
         severity: "success",
         source: job.worker ?? job.lockedBy ?? "worker",
-        message: `${job.type} finished for ${job.target}`,
+        message: `${job.type} finished for ${job.target}${isDemoMode ? " (demo timeline)" : " (no executor — timer only)"}`,
       });
     } else if (progress !== job.progress) {
       await db

@@ -283,7 +283,7 @@ export async function decideApproval(
     });
   }
 
-  if (approval.actionType === "artifact.push") {
+  if (approval.actionType === "artifact.package") {
     await db.insert(jobs).values({
       type: "artifact.package",
       status: isDemoMode ? "running" : "queued",
@@ -300,7 +300,7 @@ export async function decideApproval(
       type: "deploy.approved",
       severity: "success",
       source: actor.id,
-      message: `Đã duyệt đóng gói artifact (read-only source): ${approval.title}`,
+      message: `Đã duyệt đóng gói artifact (local bundle): ${approval.title}`,
     });
   }
 
@@ -424,10 +424,10 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
 
   /* human-in-the-loop: packaging the reconstruction bundle needs approval */
   await db.insert(approvals).values({
-    actionType: "artifact.push",
+    actionType: "artifact.package",
     targetType: "audit",
     targetId: auditId,
-    title: `Package & push reconstruction bundle của ${audit?.name ?? "audit"} (read-only source)`,
+    title: `Package reconstruction bundle của ${audit?.name ?? "audit"} (local artifact)`,
     environment: audit?.environment ?? "production",
     requestedBy: "auditor-service",
     payload: { auditId, target: "audit/recon/bundle.tar.zst" },

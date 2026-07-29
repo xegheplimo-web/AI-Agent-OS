@@ -429,10 +429,10 @@ export async function runRealAudit(auditId: string, jobId?: string): Promise<voi
     });
 
     await db.insert(approvals).values({
-      actionType: "artifact.push",
+      actionType: "artifact.package",
       targetType: "audit",
       targetId: auditId,
-      title: `Package & push reconstruction bundle của ${audit.name} (read-only source)`,
+      title: `Package reconstruction bundle của ${audit.name} (local artifact)`,
       environment,
       requestedBy: "auditor-service",
       payload: { auditId, target: "audit/recon/bundle.tar.zst" },

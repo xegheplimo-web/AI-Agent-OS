@@ -1,6 +1,6 @@
 # AI Agent OS — Control Plane + Deterministic Auditor
 
-> **Trạng thái: Alpha / MVP.** Đây là **lớp Control Plane + Auditor** của kiến trúc AI Agent OS,
+> **Trạng thái: Alpha / MVP (v0.5.0).** Đây là **lớp Control Plane + Auditor** của kiến trúc AI Agent OS,
 > **chưa phải toàn bộ hệ điều hành agent**. Auditor hiện là **rule-based deterministic**, chưa có
 > LLM reasoning. Xem [Thật vs Mô phỏng](#thật-vs-mô-phỏng) để biết chính xác phần nào đã chạy thật.
 
@@ -13,9 +13,10 @@ Audit · Architecture · Recovery · Functional Parity — xây từ **design sy
 | Audit filesystem/package/secret/DB/runtime/route | **Thật** — 6 scanner đo hệ thống |
 | Findings, SBOM, README, runbook, parity | **Thật** — suy ra từ dữ liệu đo |
 | Auth, session ký HMAC, RBAC, approval, audit log | **Thật** |
-| PostgreSQL queue, claim SKIP LOCKED, heartbeat, requeue | **Thật** |
-| Job `sbom.export` / `artifact.package` / `knowledge.reindex` | **Mô phỏng** — mới đếm thời gian |
-| Telemetry (latency/throughput/error rate), radar | **Mô phỏng** — OTLP chưa nối |
+| PostgreSQL queue, claim SKIP LOCKED, heartbeat, atomic stale recovery | **Thật** |
+| Job `audit.run` (pipeline 3 tầng) | **Thật** — worker chạy engine thật |
+| Job `sbom.export` / `parity.gate` / `artifact.package` / `knowledge.reindex` | **Mô phỏng** — chỉ đếm thời gian rồi `completed`, chưa sinh artifact/bundle/index thật |
+| Telemetry (latency/throughput/error rate), radar | **Synthetic (demo) / Unavailable (prod)** — OTLP chưa nối; API trả `source` field để UI không hiển thị số fake mà không cảnh báo |
 | Node Hermes/OpenClaw/OpenCode trên graph | **Seed data** — chưa service discovery |
 | GitHub push, Docker inspect, Trivy/Syft/Gitleaks binary | **Chưa có** |
 | Agent orchestration, planner, model router, MCP, sandbox | **Chưa có** |
@@ -31,11 +32,11 @@ Audit · Architecture · Recovery · Functional Parity — xây từ **design sy
 ┌───────▼────────┐   ┌──────▼─────────────┐   ┌──────────────┐
 │ PostgreSQL     │◄──│ Worker (production)│   │ Auditor      │
 │ state + queue  │   │ DB queue (SKIP     │   │ Engine       │
-│                │   │ LOCKED claim)      │   │ (roadmap)    │
+│                │   │ LOCKED claim)      │   │ (real, 6 sc) │
 └────────────────┘   └────────────────────┘   └──────────────┘
 ```
 
-Nguyên tắc bất biến: **Auditor không can thiệp runtime** — GitHub read-only, Docker inspect only, DB SELECT only, mọi hành động nhạy cảm đều qua **human-in-the-loop approval**.
+Nguyên tắc bất biến: **Auditor không can thiệp runtime** — DB SELECT only, mọi hành động nhạy cảm đều qua **human-in-the-loop approval**. (GitHub push / Docker inspect nằm trong roadmap, chưa triển khai.)
 
 ## Demo mode vs Production mode
 
@@ -47,7 +48,7 @@ Nguyên tắc bất biến: **Auditor không can thiệp runtime** — GitHub re
 | Findings | rút từ `FINDING_POOL` | **suy ra từ dữ liệu đo được** (secret hits, route hở, index thiếu, env drift) |
 | Artifacts | template dựng sẵn | **sinh từ inventory thật** (SBOM từ `node_modules`, mermaid từ route inventory) |
 | Jobs | inline-runner (`locked_by=inline-demo`) | claim bởi worker (`FOR UPDATE SKIP LOCKED`) |
-| Telemetry | synthetic random-walk sampler | OTLP provider (điểm cắm `src/services/telemetry.ts`) |
+| Telemetry | synthetic random-walk sampler (`source: "synthetic"`) | không có sampler — `source: "unavailable"`, `current: null` (OTLP ingestion là điểm cắm `src/services/telemetry.ts`, chưa nối) |
 | Seed | cho phép | **bị chặn** (cần `SEED_ALLOW=1`) |
 
 Header của Audit Center hiển thị badge `engine: demo timeline` / `engine: real scanners` để không ai nhầm hai chế độ.
@@ -118,7 +119,7 @@ Mọi endpoint **mutating** (`POST /api/audits/run`, `PATCH /api/findings`, `POS
 1. Operator bấm **Run Audit** với environment = `production` → audit vào trạng thái `waiting_approval`, hệ thống tạo approval request.
 2. Administrator mở **Audit Center → Approvals** → Approve/Reject.
 3. Approve → pipeline 3 tầng thực sự chạy; Reject → audit `cancelled`.
-4. Khi audit hoàn tất → tự sinh approval `artifact.push` (Package & push reconstruction bundle lên GitHub read-only source) — gate cuối của lifecycle pipeline trên Overview.
+4. Khi audit hoàn tất → tự sinh approval `artifact.package` (Package reconstruction bundle — local artifact, chưa push GitHub) — gate cuối của lifecycle pipeline trên Overview. Approve → tạo job `artifact.package` (hiện vẫn mô phỏng theo timer; executor thật nằm trong roadmap).
 
 ## REST API
 
@@ -163,13 +164,13 @@ npm run worker              # mode từ .env
 APP_MODE=production npm run worker
 ```
 
-**Ownership rule**: mỗi `audit.run` job mang `auditId`; worker chỉ chạy audit của job **chính nó đã claim** (`locked_by = workerId`). Quét `audits WHERE status='running'` sẽ khiến hai worker cùng chạy một audit — đó là lỗi đã được sửa và có regression test.
+**Ownership rule**: mỗi `audit.run` job mang `auditId`; worker chỉ chạy audit của job **chính nó đã claim** (`locked_by = workerId`). Quét `audits WHERE status='running'` sẽ khiến hai worker cùng chạy một audit — đó là lỗi đã được sửa và có regression test. `advanceJobsOnce(workerId)` cũng lọc theo `locked_by` cho non-audit jobs, nên hai worker không cùng advance một job.
 
-- Claim: `FOR UPDATE SKIP LOCKED`, `attempt < max_attempts`
-- Heartbeat trong suốt audit; job hoàn tất **cùng** audit (không còn kẹt `running`)
-- Stale recovery **bao gồm** `audit.run`: requeue khi heartbeat > 45s, `timed_out` + audit `failed` khi hết attempts
-- Resume idempotent: `UNIQUE(audit_id, path)` cho artifacts, `UNIQUE(audit_id, fingerprint)` cho findings → retry ghi đè, không nhân bản
-- `UNIQUE(idempotency_key)` + xử lý conflict → hai request đồng thời không tạo hai audit
+- Claim: `FOR UPDATE SKIP LOCKED`, `attempt < max_attempts`, **`LIMIT 1`** (worker xử lý tuần tự; claim 3 sẽ để 2 job kẹt `running` không heartbeat cho đến khi stale supervisor requeue)
+- Heartbeat trong suốt audit; job hoàn tất **cùng** audit trong một transaction (parity upsert + audit→completed + event + job→completed commit cùng nhau)
+- Stale recovery **atomic**: `UPDATE … WHERE heartbeat < now()-45s RETURNING` per outcome (không SELECT-then-UPDATE-by-id); bao gồm `audit.run`: requeue khi heartbeat > 45s, `timed_out` + audit `failed` khi hết attempts
+- Resume idempotent: `UNIQUE(audit_id, path)` cho artifacts, `UNIQUE(audit_id, fingerprint)` cho findings, `UNIQUE(audit_id)` cho parity reports → retry ghi đè, không nhân bản
+- `UNIQUE(idempotency_key)` (partial, `WHERE NOT NULL`) + xử lý conflict → hai request đồng thời không tạo hai audit
 - Approval quyết định atomic (`UPDATE … WHERE status='pending' RETURNING`) → không double-spawn job
 
 Kiểm chứng bằng 23 assertion thật:
@@ -182,6 +183,18 @@ npm run audit:verify     # chạy engine thật, verify sha256 mọi artifact
 ## Realtime
 
 `GET /api/stream/events` — Server-Sent Events phát từ bảng `events` (delta theo id, heartbeat 15s). Frontend (`EventsFeed`) dùng `EventSource`; khi stream rơi tự chuyển sang polling 5s, hiển thị trạng thái `SSE live` / `polling`.
+
+## Telemetry provenance
+
+`GET /api/telemetry/summary` trả field `source` để UI không bao giờ hiển thị số fake mà không cảnh báo:
+
+| `source` | Ý nghĩa | `current` / `radar` |
+|---|---|---|
+| `otlp` | collector thật đã ingest points (chưa có ingestion code, nên chưa bao giờ trả giá trị này) | có dữ liệu |
+| `synthetic` | demo-mode random-walk sampler (`sampleTelemetryOnce`) ghi rows | có dữ liệu (nguồn là `Math.sin`/random-walk, không phải app) |
+| `unavailable` | không collector, không sampler | `null` — không fallback fabricated |
+
+UI (`DataSourceBadge`) hiển thị badge theo `source`: `otlp live` / `synthetic data — no collector` / `no telemetry — collector not connected`. Trước đây production không collector vẫn hiện 128ms/1284rps/radar đầy đủ không cảnh báo — false provenance đã sửa.
 
 ## Desktop packaging (Tauri 2)
 
@@ -221,8 +234,11 @@ src-tauri/                # desktop scaffold
 
 ## Roadmap (từ review)
 
-- [ ] Auditor Engine thật: Syft/Trivy/Gitleaks/Docker inspect (Python `auditor/` package, contract JSON chia sẻ)
+- [ ] Executor thật cho `sbom.export` / `parity.gate` / `artifact.package` / `knowledge.reindex` (hiện chỉ mô phỏng theo timer)
+- [ ] OTLP ingestion thật (điểm cắm `src/services/telemetry.ts`) → `source: "otlp"`
+- [ ] GitHub push thật cho reconstruction bundle (hiện `artifact.package` chỉ package local, chưa push)
 - [ ] Artifact object storage (MinIO/S3) — metadata đã sẵn (storageProvider/storageKey/sha256)
+- [ ] Docker inspect, Trivy/Syft/Gitleaks binary scanner (Python `auditor/` package, contract JSON chia sẻ)
 - [ ] Baseline comparison đầy đủ: Production vs Clean VM (services/ports/env/migrations)
 - [ ] Playwright E2E suite
 - [ ] OIDC provider thay cho auth nội bộ tối thiểu

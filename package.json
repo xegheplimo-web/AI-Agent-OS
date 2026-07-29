@@ -19,6 +19,8 @@
     "verify": "npm run lint && npm run typecheck && npm run test && npm run build",
     "audit:verify": "tsx scripts/verify-real-engine.ts",
     "verify:worker": "tsx scripts/verify-worker.ts",
+    "verify:release": "tsx scripts/verify-release.ts",
+    "verify:executors": "tsx scripts/verify-executors.ts",
     "icons": "node scripts/generate-icons.mjs"
   },
   "dependencies": {

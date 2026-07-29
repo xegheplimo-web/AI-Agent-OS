@@ -157,7 +157,7 @@ async function main() {
 
   /* ---------- 11. approval decision is atomic -------------------------- */
   const [appr] = await db.insert(approvals).values({
-    actionType: "artifact.push", targetType: "audit", targetId: auditId,
+    actionType: "artifact.package", targetType: "audit", targetId: auditId,
     title: "verify concurrency", environment: "local", requestedBy: "verify",
   }).returning();
 

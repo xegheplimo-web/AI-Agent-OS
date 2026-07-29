@@ -221,10 +221,10 @@ async function main() {
   /* ---------------- approvals ---------------- */
   await db.insert(schema.approvals).values([
     {
-      actionType: "artifact.push",
+      actionType: "artifact.package",
       targetType: "audit",
       targetId: auditId,
-      title: "Package & push reconstruction bundle của AUD-20260107-014 (read-only source)",
+      title: "Package reconstruction bundle của AUD-20260107-014 (local artifact)",
       status: "pending",
       requestedBy: "auditor-service",
       requestedAt: new Date(now - 38 * 60 * 1000),
