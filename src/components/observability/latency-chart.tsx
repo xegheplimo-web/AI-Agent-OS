@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { AlarmClock, GitCommitVertical, TriangleAlert, TrendingUp } from "lucide-react";
+import { AlarmClock, GitCommitVertical, TrendingUp } from "lucide-react";
 import {
   Area,
   AreaChart,
@@ -14,18 +14,8 @@ import {
   YAxis,
 } from "recharts";
 import { api } from "@/lib/api";
-import { isDemoModeClient } from "@/lib/mode-client";
 import { Panel } from "@/components/ui";
-
-function SimulatedBanner() {
-  if (!isDemoModeClient()) return null;
-  return (
-    <div className="mb-2 flex items-center gap-2 rounded-lg border border-amber/25 bg-amber/8 px-2.5 py-1.5 font-mono text-[9px] tracking-[0.14em] text-amber/80 uppercase">
-      <TriangleAlert className="size-3 shrink-0" />
-      synthetic data — OTLP provider chưa kết nối
-    </div>
-  );
-}
+import { DataSourceBadge } from "@/components/observability/data-source-badge";
 
 function useTelemetry() {
   return useQuery({ queryKey: ["telemetry"], queryFn: api.telemetry, refetchInterval: 6000 });
@@ -48,6 +38,7 @@ const tooltipStyle = {
 
 export function LatencyChart() {
   const telemetry = useTelemetry();
+  const source = telemetry.data?.source ?? "unavailable";
   const p95 = telemetry.data?.series.latencyP95 ?? [];
   const p50 = telemetry.data?.series.latencyP50 ?? [];
   const data = p95.map((p, i) => ({ ts: p.ts, p95: p.value, p50: p50[i]?.value ?? null }));
@@ -61,12 +52,12 @@ export function LatencyChart() {
       tone="cyan"
       right={
         <div className="flex items-center gap-3 font-mono text-[9.5px] text-mute">
-          <span className="flex items-center gap-1"><span className="h-0.5 w-4 bg-cyan" />p95 <span className="text-cyan">{cur ? `${Math.round(cur.latencyP95)}ms` : ""}</span></span>
-          <span className="flex items-center gap-1"><span className="h-0.5 w-4 bg-violet" />p50 <span className="text-violet">{cur ? `${Math.round(cur.latencyP50)}ms` : ""}</span></span>
+          <span className="flex items-center gap-1"><span className="h-0.5 w-4 bg-cyan" />p95 <span className="text-cyan">{cur ? `${Math.round(cur.latencyP95)}ms` : "—"}</span></span>
+          <span className="flex items-center gap-1"><span className="h-0.5 w-4 bg-violet" />p50 <span className="text-violet">{cur ? `${Math.round(cur.latencyP50)}ms` : "—"}</span></span>
         </div>
       }
     >
-      <SimulatedBanner />
+      <DataSourceBadge source={source} />
       <div className="h-[220px]">
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={data} margin={{ top: 4, right: 4, bottom: 0, left: -18 }}>
@@ -103,7 +94,7 @@ export function ThroughputChart() {
       title="Throughput"
       icon={TrendingUp}
       tone="azure"
-      right={<span className="font-mono text-[9.5px] text-mute">req/min · <span className="text-azure">{cur ? Math.round(cur.throughput) : ""}</span></span>}
+      right={<span className="font-mono text-[9.5px] text-mute">req/min · <span className="text-azure">{cur ? Math.round(cur.throughput) : "—"}</span></span>}
     >
       <div className="h-[220px]">
         <ResponsiveContainer width="100%" height="100%">
@@ -136,7 +127,7 @@ export function ErrorRateChart() {
       title="Error Rate"
       icon={GitCommitVertical}
       tone="rose"
-      right={<span className="font-mono text-[9.5px] text-mute">% · <span className="text-rose">{cur ? cur.errorRate.toFixed(2) : ""}%</span></span>}
+      right={<span className="font-mono text-[9.5px] text-mute">% · <span className="text-rose">{cur ? `${cur.errorRate.toFixed(2)}%` : "—"}</span></span>}
     >
       <div className="h-[220px]">
         <ResponsiveContainer width="100%" height="100%">

@@ -295,7 +295,7 @@ export const sessions = pgTable("sessions", {
 /* ------------------------------------------------------------------ */
 export const approvals = pgTable("approvals", {
   id: uuid("id").primaryKey().defaultRandom(),
-  actionType: text("action_type").notNull(), // audit.run | artifact.push | artifact.package | config.change
+  actionType: text("action_type").notNull(), // audit.run | artifact.package | config.change
   targetType: text("target_type").notNull().default("system"),
   targetId: text("target_id").notNull().default(""),
   title: text("title").notNull(),

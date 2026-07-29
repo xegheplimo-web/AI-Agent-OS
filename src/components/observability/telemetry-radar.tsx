@@ -5,6 +5,7 @@ import { Activity, BarChart4, Footprints, Radio, ScrollText } from "lucide-react
 import { api } from "@/lib/api";
 import { formatNumber } from "@/lib/utils";
 import { Panel } from "@/components/ui";
+import { DataSourceBadge } from "@/components/observability/data-source-badge";
 
 const BLIPS = [
   { angle: 40, dist: 0.62, color: "#37d6ff" },
@@ -15,20 +16,22 @@ const BLIPS = [
 
 export function TelemetryRadar({ compact = false }: { compact?: boolean }) {
   const telemetry = useQuery({ queryKey: ["telemetry"], queryFn: api.telemetry, refetchInterval: 6000 });
+  const source = telemetry.data?.source ?? "unavailable";
   const r = telemetry.data?.radar;
 
   const size = compact ? 148 : 176;
   const c = size / 2;
 
   const channels = [
-    { icon: Activity, label: "traces", value: r ? `${r.traces.active} active` : "…", sub: r ? `${r.traces.sampledPct}% sampled` : "", color: "#37d6ff" },
-    { icon: BarChart4, label: "metrics", value: r ? `${r.metrics.series} series` : "…", sub: r ? `${r.metrics.scrapeOk}% scrape ok` : "", color: "#8b5cf6" },
-    { icon: ScrollText, label: "logs", value: r ? `${formatNumber(r.logs.linesPerMin)}/min` : "…", sub: r ? `${r.logs.errorLines} errors` : "", color: "#20e3a2" },
-    { icon: Footprints, label: "baggage", value: r ? `${r.baggage.keys} keys` : "…", sub: r ? `${r.baggage.propagationPct}% propagated` : "", color: "#ffb454" },
+    { icon: Activity, label: "traces", value: r ? `${r.traces.active} active` : "—", sub: r ? `${r.traces.sampledPct}% sampled` : "", color: "#37d6ff" },
+    { icon: BarChart4, label: "metrics", value: r ? `${r.metrics.series} series` : "—", sub: r ? `${r.metrics.scrapeOk}% scrape ok` : "", color: "#8b5cf6" },
+    { icon: ScrollText, label: "logs", value: r ? `${formatNumber(r.logs.linesPerMin)}/min` : "—", sub: r ? `${r.logs.errorLines} errors` : "", color: "#20e3a2" },
+    { icon: Footprints, label: "baggage", value: r ? `${r.baggage.keys} keys` : "—", sub: r ? `${r.baggage.propagationPct}% propagated` : "", color: "#ffb454" },
   ];
 
   return (
     <Panel title="Observability" icon={Radio} tone="cyan">
+      <DataSourceBadge source={source} />
       <div className="flex items-center gap-4">
         {/* radar disc */}
         <div className="relative shrink-0 rounded-full border border-cyan/20" style={{ width: size, height: size }}>
