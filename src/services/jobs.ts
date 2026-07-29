@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, or } from "drizzle-orm";
 import { db } from "@/db";
 import { audits, events, jobs } from "@/db/schema";
 import type { Actor } from "@/lib/auth";
@@ -66,9 +66,20 @@ export async function enqueueJob(
   return serializeJob(row);
 }
 
-/* One engine tick — shared by demo inline runner and the worker process. */
-export async function advanceJobsOnce(): Promise<void> {
-  const active = await db.select().from(jobs).where(eq(jobs.status, "running"));
+/**
+ * One engine tick — shared by demo inline runner and the worker process.
+ *
+ * `workerId` scopes the query to jobs this worker owns (locked_by match).
+ * Without it, every worker's tick would advance every running job, making
+ * the locked_by ownership field decorative for non-audit.run job types.
+ * Demo mode calls without a workerId because all jobs are owned by
+ * "inline-demo" and there is only one inline runner.
+ */
+export async function advanceJobsOnce(workerId?: string): Promise<void> {
+  const ownerFilter = workerId
+    ? and(eq(jobs.status, "running"), or(eq(jobs.lockedBy, workerId), eq(jobs.lockedBy, "inline-demo")))
+    : eq(jobs.status, "running");
+  const active = await db.select().from(jobs).where(ownerFilter);
   const now = Date.now();
   for (const job of active) {
     if (job.type === "audit.run") continue; // audit pipeline owns its own completion

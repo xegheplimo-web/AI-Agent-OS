@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { db } from "@/db";
 import { approvals, artifacts, audits, events, findings, jobs, parityReports, telemetryPoints } from "@/db/schema";
 import { computeParityScore } from "@/lib/parity";
@@ -447,9 +447,19 @@ export async function runRealAudit(auditId: string, jobId?: string): Promise<voi
         })
         .where(eq(jobs.id, jobId));
 
-      /* A retryable job puts the audit back in the runnable state. */
+      /* A retryable job puts the audit back in the runnable state — but only
+         if a concurrent requeueStaleJobs hasn't already timed out the job.
+         Without this guard, the engine can resurrect a `failed` audit whose
+         job was already set to `timed_out` by the supervisor, leaving the
+         audit orphaned (running with no active job). */
       if (!exhausted) {
-        await db.update(audits).set({ status: "running", finishedAt: null }).where(eq(audits.id, auditId));
+        const [currentJob] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
+        if (currentJob?.status !== "timed_out") {
+          await db
+            .update(audits)
+            .set({ status: "running", finishedAt: null })
+            .where(and(eq(audits.id, auditId), eq(audits.status, "failed")));
+        }
       }
     }
 

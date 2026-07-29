@@ -282,12 +282,15 @@ export async function decideApproval(
   if (approval.actionType === "artifact.push") {
     await db.insert(jobs).values({
       type: "artifact.package",
-      status: "running",
+      status: isDemoMode ? "running" : "queued",
+      auditId: approval.targetId,
       target: (approval.payload?.target as string) ?? "audit/recon/bundle.tar.zst",
       progress: 0,
+      attempt: isDemoMode ? 1 : 0,
       lockedBy: isDemoMode ? "inline-demo" : null,
+      worker: isDemoMode ? "inline-demo" : null,
       heartbeatAt: new Date(),
-      startedAt: new Date(),
+      startedAt: isDemoMode ? new Date() : null,
     });
     await db.insert(events).values({
       type: "deploy.approved",
@@ -430,7 +433,7 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
   await db
     .update(jobs)
     .set({ status: "completed", progress: 100, finishedAt: new Date(), updatedAt: new Date() })
-    .where(and(eq(jobs.type, "audit.run"), eq(jobs.status, "running")));
+    .where(and(eq(jobs.type, "audit.run"), eq(jobs.auditId, auditId)));
 }
 
 const BOUNDS_TOTAL = STAGE_DURATION_MS.reduce((a, b) => a + b, 0);

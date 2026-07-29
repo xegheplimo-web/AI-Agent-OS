@@ -54,7 +54,7 @@ async function main() {
     busy = true;
     try {
       await claimJobs();
-      await advanceJobsOnce();
+      await advanceJobsOnce(workerId);
 
       if (isDemoMode) {
         await advanceAuditsOnce();
