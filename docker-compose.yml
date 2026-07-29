@@ -1,0 +1,148 @@
+# ---------------------------------------------------------------------------
+# Profiles keep the two execution models from ever overlapping:
+#
+#   docker compose --profile demo up --build
+#     → migrate → seed → dashboard(APP_MODE=demo). NO worker: the demo engine
+#       advances inline and a second engine would race it.
+#
+#   docker compose --profile production up --build
+#     → migrate → dashboard(enqueue only) + worker(real auditor engine).
+#
+#   docker compose --profile cache up -d redis     (optional, see README)
+#
+# `migrate` runs drizzle-kit push against the SAME DATABASE_URL the app uses
+# and must exit 0 before the dashboard starts — otherwise the app boots
+# against an empty database and every query 500s.
+# ---------------------------------------------------------------------------
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: agent_os
+      POSTGRES_PASSWORD: agent_os
+      POSTGRES_DB: agent_os
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_os -d agent_os"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    profiles: ["demo", "production"]
+
+  # --- schema bootstrap (runs once, both profiles) --------------------------
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node_modules/.bin/drizzle-kit", "push", "--force"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://agent_os:agent_os@postgres:5432/agent_os
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    profiles: ["demo", "production"]
+
+  # --- demo data (demo profile only) ---------------------------------------
+  seed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node_modules/.bin/tsx", "src/db/seed.ts"]
+    environment:
+      NODE_ENV: production
+      APP_MODE: demo
+      DATABASE_URL: postgresql://agent_os:agent_os@postgres:5432/agent_os
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+    profiles: ["demo"]
+
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    profiles: ["cache"]
+
+  dashboard-demo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: production
+      APP_MODE: demo
+      NEXT_PUBLIC_APP_MODE: demo
+      DATABASE_URL: postgresql://agent_os:agent_os@postgres:5432/agent_os
+      API_INTERNAL_TOKEN: change-me-internal-token-min-16
+      SESSION_SECRET: change-me-session-secret-min-16
+    ports:
+      - "3000:3000"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health | grep -q '\"ok\":true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    profiles: ["demo"]
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: production
+      APP_MODE: production
+      NEXT_PUBLIC_APP_MODE: production
+      DATABASE_URL: postgresql://agent_os:agent_os@postgres:5432/agent_os
+      AUDITOR_SERVICE_TOKEN: change-me-auditor-token-min-16
+      WORKER_SERVICE_TOKEN: change-me-worker-token-min-16
+      SESSION_SECRET: change-me-session-secret-min-16
+    ports:
+      - "3000:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health | grep -q '\"ok\":true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    profiles: ["production"]
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node_modules/.bin/tsx", "src/worker/index.ts"]
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      APP_MODE: production
+      DATABASE_URL: postgresql://agent_os:agent_os@postgres:5432/agent_os
+      WORKER_SERVICE_TOKEN: change-me-worker-token-min-16
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # Multiple replicas are safe: jobs are claimed FOR UPDATE SKIP LOCKED
+    # and each audit belongs to exactly one claimed job. The worker heartbeats;
+    # if it crashes, `restart: unless-stopped` + requeueStaleJobs() recover it.
+    deploy:
+      replicas: 1
+    profiles: ["production"]
+
+volumes:
+  postgres-data:

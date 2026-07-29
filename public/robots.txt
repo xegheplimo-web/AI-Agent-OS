@@ -1,0 +1,3 @@
+# AI Agent OS — internal control plane. Not for public indexing.
+User-agent: *
+Disallow: /

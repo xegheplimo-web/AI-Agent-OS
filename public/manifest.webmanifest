@@ -1,0 +1,16 @@
+{
+  "name": "AI Agent OS — Control Plane",
+  "short_name": "Agent OS",
+  "description": "Audit · Architecture · Recovery · Functional Parity",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#020713",
+  "theme_color": "#37d6ff",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

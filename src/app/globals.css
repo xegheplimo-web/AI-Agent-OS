@@ -1,0 +1,264 @@
+@import "@xyflow/react/dist/style.css";
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-space), var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jet), ui-monospace, "SF Mono", monospace;
+}
+
+@theme {
+  --color-void: #020713;
+  --color-abyss: #040d20;
+  --color-panel: #071428;
+  --color-line: rgba(73, 180, 255, 0.22);
+  --color-cyan: #37d6ff;
+  --color-aqua: #19c2ff;
+  --color-azure: #3187ff;
+  --color-violet: #8b5cf6;
+  --color-mint: #20e3a2;
+  --color-rose: #ff5f7a;
+  --color-amber: #ffb454;
+  --color-ink: #e9f6ff;
+  --color-mute: #7890aa;
+
+  --animate-spin-slow: spin 14s linear infinite;
+  --animate-spin-rev: spin-rev 22s linear infinite;
+  --animate-sweep: spin 4.2s linear infinite;
+  --animate-dashflow: dashflow 1.4s linear infinite;
+  --animate-ping-soft: ping-soft 2.4s cubic-bezier(0, 0, 0.2, 1) infinite;
+  --animate-blink: blink 1.6s ease-in-out infinite;
+  --animate-shimmer: shimmer 2.8s linear infinite;
+}
+
+@keyframes spin-rev {
+  from { transform: rotate(360deg); }
+  to { transform: rotate(0deg); }
+}
+@keyframes dashflow {
+  to { stroke-dashoffset: -18; }
+}
+@keyframes ping-soft {
+  0% { transform: scale(1); opacity: 0.7; }
+  80%, 100% { transform: scale(2.1); opacity: 0; }
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes scan-y {
+  0% { top: -12%; }
+  100% { top: 112%; }
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background-color: #020713;
+  color: #e9f6ff;
+  font-family: var(--font-sans);
+  overflow-x: hidden;
+}
+
+/* ---------- scrollbar ---------- */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(55, 214, 255, 0.18);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(55, 214, 255, 0.35); }
+::selection { background: rgba(55, 214, 255, 0.28); }
+
+/* ---------- backgrounds ---------- */
+.circuit-bg {
+  background-color: #020713;
+  background-image:
+    linear-gradient(rgba(45, 140, 220, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(45, 140, 220, 0.045) 1px, transparent 1px),
+    linear-gradient(rgba(45, 140, 220, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(45, 140, 220, 0.025) 1px, transparent 1px),
+    radial-gradient(ellipse 90% 60% at 50% 38%, rgba(22, 118, 255, 0.13), transparent 62%),
+    radial-gradient(ellipse 42% 34% at 82% 12%, rgba(139, 92, 246, 0.08), transparent 70%);
+  background-size: 42px 42px, 42px 42px, 210px 210px, 210px 210px, auto, auto;
+}
+
+/* ---------- glass panels ---------- */
+.glass {
+  background: linear-gradient(180deg, rgba(15, 40, 78, 0.62), rgba(3, 12, 28, 0.84));
+  border: 1px solid rgba(77, 187, 255, 0.22);
+  backdrop-filter: blur(16px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.045),
+    0 16px 50px rgba(0, 0, 0, 0.42),
+    0 0 32px rgba(36, 163, 255, 0.07);
+}
+
+.glass-soft {
+  background: linear-gradient(180deg, rgba(12, 32, 62, 0.42), rgba(4, 14, 30, 0.62));
+  border: 1px solid rgba(77, 187, 255, 0.14);
+  backdrop-filter: blur(10px);
+}
+
+.hud-corner {
+  position: relative;
+}
+.hud-corner::before,
+.hud-corner::after {
+  content: "";
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
+  z-index: 2;
+}
+.hud-corner::before {
+  top: -1px;
+  left: -1px;
+  border-top: 1.5px solid rgba(55, 214, 255, 0.75);
+  border-left: 1.5px solid rgba(55, 214, 255, 0.75);
+  border-top-left-radius: inherit;
+}
+.hud-corner::after {
+  bottom: -1px;
+  right: -1px;
+  border-bottom: 1.5px solid rgba(55, 214, 255, 0.75);
+  border-right: 1.5px solid rgba(55, 214, 255, 0.75);
+  border-bottom-right-radius: inherit;
+}
+
+/* clip-path badge (angled pill like SYSTEM HEALTH in the reference) */
+.angled-pill {
+  clip-path: polygon(12px 0, 100% 0, calc(100% - 12px) 100%, 0 100%);
+}
+
+/* ---------- glow text ---------- */
+.text-glow-cyan { text-shadow: 0 0 14px rgba(55, 214, 255, 0.65), 0 0 46px rgba(55, 214, 255, 0.3); }
+.text-glow-soft { text-shadow: 0 0 18px rgba(120, 190, 255, 0.4); }
+
+.hero-title {
+  background: linear-gradient(180deg, #ffffff 8%, #bfe6ff 42%, #5fb0ff 78%, #2e7fe8 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 0 26px rgba(70, 170, 255, 0.5)) drop-shadow(0 2px 10px rgba(20, 80, 200, 0.45));
+}
+
+/* ---------- node glow ---------- */
+.node-glow {
+  box-shadow:
+    0 0 0 1px rgba(49, 175, 255, 0.35),
+    0 0 16px rgba(25, 165, 255, 0.28),
+    inset 0 0 18px rgba(50, 140, 255, 0.09);
+}
+.node-glow-violet {
+  box-shadow:
+    0 0 0 1px rgba(139, 92, 246, 0.5),
+    0 0 18px rgba(139, 92, 246, 0.32),
+    inset 0 0 18px rgba(139, 92, 246, 0.12);
+}
+.node-glow-mint {
+  box-shadow:
+    0 0 0 1px rgba(32, 227, 162, 0.4),
+    0 0 16px rgba(32, 227, 162, 0.25),
+    inset 0 0 18px rgba(32, 227, 162, 0.08);
+}
+
+/* ---------- scanline ---------- */
+.scanline {
+  position: relative;
+  overflow: hidden;
+}
+.scanline::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 22%;
+  background: linear-gradient(180deg, transparent, rgba(55, 214, 255, 0.05), transparent);
+  animation: scan-y 7s linear infinite;
+  pointer-events: none;
+}
+
+/* ---------- shimmer skeleton ---------- */
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    rgba(18, 46, 88, 0.4) 25%,
+    rgba(55, 214, 255, 0.12) 50%,
+    rgba(18, 46, 88, 0.4) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2.2s linear infinite;
+}
+
+/* ---------- react flow overrides ---------- */
+.react-flow {
+  background: transparent !important;
+}
+.react-flow__attribution {
+  display: none;
+}
+.react-flow__edge-path {
+  stroke: rgba(60, 190, 255, 0.55);
+  stroke-width: 1.6;
+}
+.react-flow__edge.audit-edge .react-flow__edge-path {
+  stroke: rgba(139, 92, 246, 0.6);
+  stroke-dasharray: 7 7;
+}
+.react-flow__edge.animated-edge .react-flow__edge-path {
+  stroke-dasharray: 9 9;
+  animation: dashflow 1.2s linear infinite;
+}
+.react-flow__handle {
+  opacity: 0;
+  width: 6px;
+  height: 6px;
+  pointer-events: none;
+}
+.react-flow__controls {
+  background: rgba(7, 20, 42, 0.85) !important;
+  border: 1px solid rgba(77, 187, 255, 0.22) !important;
+  border-radius: 10px !important;
+  overflow: hidden;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+}
+.react-flow__controls-button {
+  background: transparent !important;
+  border-bottom: 1px solid rgba(77, 187, 255, 0.12) !important;
+  fill: #9fd8ff !important;
+}
+.react-flow__controls-button:hover {
+  background: rgba(55, 214, 255, 0.1) !important;
+}
+.react-flow__minimap {
+  background: rgba(4, 13, 32, 0.92) !important;
+  border: 1px solid rgba(77, 187, 255, 0.22);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.react-flow__minimap-mask { fill: rgba(2, 7, 19, 0.72); }
+.react-flow__minimap-node { fill: rgba(55, 140, 230, 0.5); }
+
+/* ---------- misc ---------- */
+.mask-fade-b { mask-image: linear-gradient(180deg, black 62%, transparent 100%); }
+.divider-glow {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(55, 214, 255, 0.5), transparent);
+}
+.ring-dashed {
+  background-image: repeating-conic-gradient(
+    from 0deg,
+    rgba(55, 214, 255, 0.7) 0deg 4deg,
+    transparent 4deg 13deg
+  );
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), black calc(100% - 2px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), black calc(100% - 2px));
+}

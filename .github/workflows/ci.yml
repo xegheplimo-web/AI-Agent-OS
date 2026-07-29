@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: agent_os
+          POSTGRES_PASSWORD: agent_os
+          POSTGRES_DB: agent_os
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_os -d agent_os"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+
+    env:
+      DATABASE_URL: postgresql://agent_os:agent_os@localhost:5432/agent_os
+      APP_MODE: demo
+      API_INTERNAL_TOKEN: ci-internal-token
+      SESSION_SECRET: ci-session-secret
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify lockfile is committed (npm ci / Docker depend on it)
+        run: test -f package-lock.json || (echo "::error::package-lock.json is missing — npm ci will fail" && exit 1)
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - run: npm run typecheck
+
+      - name: Push schema
+        run: npm run db:push
+
+      - name: Seed demo data
+        run: npm run db:seed
+
+      - run: npm run test
+
+      # Exercises the REAL auditor engine against PostgreSQL: runs all six
+      # scanners, writes artifacts and verifies every sha256.
+      - name: Verify real auditor engine
+        run: npm run audit:verify
+
+      # Production-mode lifecycle: enqueue → worker claim → audit completed
+      # → audit.run job completed (regression guard for the stuck-job bug).
+      - name: Verify production worker lifecycle
+        run: npm run verify:worker
+
+      - run: npm run build
+
+      - name: Smoke test API
+        run: |
+          npm run start &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3000/api/health && break || sleep 2
+          done
+          curl -sf http://localhost:3000/api/system/health > /dev/null
+          curl -sf http://localhost:3000/api/audits > /dev/null
+          curl -sf http://localhost:3000/api/parity/latest > /dev/null
+          kill $SERVER_PID
