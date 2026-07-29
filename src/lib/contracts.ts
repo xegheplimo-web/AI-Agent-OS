@@ -142,7 +142,7 @@ export type ParityReportDTO = z.infer<typeof parityReportDtoSchema>;
 export const jobDtoSchema = z.object({
   id: z.string().uuid(),
   type: z.string(),
-  status: z.enum(["queued", "preparing", "running", "waiting_approval", "completed", "failed", "cancelled", "timed_out"]),
+  status: z.enum(["queued", "running", "completed", "failed", "cancelled", "timed_out"]),
   target: z.string(),
   progress: z.number(),
   attempt: z.number().default(0),
