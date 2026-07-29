@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AI Agent OS",
-  "version": "0.1.0",
   "identifier": "os.agent.ai",
   "build": {
     "beforeDevCommand": "npm run dev",

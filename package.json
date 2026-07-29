@@ -1,5 +1,6 @@
 {
-  "name": "nextjs-postgresql-template",
+  "name": "ai-agent-os",
+  "version": "0.5.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -17,7 +18,8 @@
     "worker": "tsx src/worker/index.ts",
     "verify": "npm run lint && npm run typecheck && npm run test && npm run build",
     "audit:verify": "tsx scripts/verify-real-engine.ts",
-    "verify:worker": "tsx scripts/verify-worker.ts"
+    "verify:worker": "tsx scripts/verify-worker.ts",
+    "icons": "node scripts/generate-icons.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.4",

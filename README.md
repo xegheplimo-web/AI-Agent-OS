@@ -147,7 +147,7 @@ Response được **parse qua Zod contracts** (`src/lib/contracts.ts`) trước 
 make dev build start      # vòng đứng app
 make db-push db-seed      # schema + demo data
 make worker               # APP_MODE=production worker (DB queue)
-make test                 # 34 unit tests (Vitest)
+make test                 # 56 unit tests (Vitest)
 make docker-up            # full stack qua compose
 ```
 

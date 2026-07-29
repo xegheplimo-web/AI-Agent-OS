@@ -4,6 +4,7 @@ import { db } from "@/db";
 import { approvals, artifacts, audits, events, findings, jobs, parityReports, telemetryPoints } from "@/db/schema";
 import { computeParityScore } from "@/lib/parity";
 import { logAudit } from "@/lib/audit-log";
+import { GENERATOR_VERSION } from "@/lib/version";
 import { DISCOVERY_SCANNERS } from "@/services/auditor/scanners";
 import { normalize, parityChecksFrom } from "@/services/auditor/normalize";
 import {
@@ -106,7 +107,7 @@ async function persistArtifact(params: {
     sha256: sha256(params.content),
     schemaVersion: "1.0",
     generator: "ai-system-auditor",
-    generatorVersion: "0.4.0",
+    generatorVersion: GENERATOR_VERSION,
     environment: params.environment,
     content: params.content,
     tags: params.tags,
@@ -277,7 +278,10 @@ export async function runRealAudit(auditId: string, jobId?: string): Promise<voi
       .where(eq(telemetryPoints.metric, "latency_p95"))
       .orderBy(desc(telemetryPoints.ts))
       .limit(1);
-    const latencyP95 = p95Rows.length ? p95Rows[0].value : 0;
+    /* null — not 0 — when there is no telemetry. A 0ms fallback used to make
+       the p95 parity check read "passed" on a system with no collector, which
+       is a false-green. null propagates to a `pending` check instead. */
+    const latencyP95: number | null = p95Rows.length ? p95Rows[0].value : null;
 
     const checks = parityChecksFrom(inv, latencyP95);
     const { score: parityScore, overallStatus } = computeParityScore(checks);
@@ -361,36 +365,67 @@ export async function runRealAudit(auditId: string, jobId?: string): Promise<voi
     const severityPenalty = counts.critical * 12 + counts.high * 6 + counts.medium * 3 + counts.low * 1;
     const auditScore = Math.max(0, Math.min(100, 100 - severityPenalty));
 
-    await db.insert(parityReports).values({
-      overallStatus,
-      score: parityScore,
-      environment,
-      checks,
-      gates: [
-        { key: "secrets_scan", label: "Secrets scan", status: counts.critical > 0 ? "failed" : "passed" },
-        { key: "sbom_diff", label: "SBOM generated", status: "passed" },
-        { key: "endpoint_authz", label: "Endpoint authorization", status: checks.find((c) => c.key === "endpoint_authz")?.status ?? "passed" },
-        { key: "lockfile", label: "Deterministic install (lockfile)", status: (inv.repo as { lockFilePresent?: boolean }).lockFilePresent ? "passed" : "failed" },
-      ],
-    });
+    const parityGates = [
+      { key: "secrets_scan", label: "Secrets scan", status: counts.critical > 0 ? "failed" : "passed" },
+      { key: "sbom_diff", label: "SBOM generated", status: "passed" },
+      { key: "endpoint_authz", label: "Endpoint authorization", status: checks.find((c) => c.key === "endpoint_authz")?.status ?? "passed" },
+      { key: "lockfile", label: "Deterministic install (lockfile)", status: (inv.repo as { lockFilePresent?: boolean }).lockFilePresent ? "passed" : "failed" },
+    ];
 
-    await db
-      .update(audits)
-      .set({
-        status: "completed",
-        score: auditScore,
-        findingsCount: counts,
-        artifactNames: [...stages[0].artifacts, ...stages[1].artifacts, ...stages[2].artifacts],
-        finishedAt: new Date(),
-        stages,
-      })
-      .where(eq(audits.id, auditId));
+    /* The audit→completed, parity report, outcome event and job→completed
+       transitions are committed together. A crash between them used to leave
+       a completed audit with a still-`running` job (or vice versa); the
+       transaction makes the outcome atomic. The approval request and audit
+       log are append-only side effects and stay outside the transaction. */
+    await db.transaction(async (tx) => {
+      await tx
+        .insert(parityReports)
+        .values({
+          auditId,
+          overallStatus,
+          score: parityScore,
+          environment,
+          checks,
+          gates: parityGates,
+        })
+        .onConflictDoUpdate({
+          target: [parityReports.auditId],
+          set: {
+            overallStatus,
+            score: parityScore,
+            checks,
+            gates: parityGates,
+            environment,
+          },
+        });
 
-    await db.insert(events).values({
-      type: "audit.completed",
-      severity: "success",
-      source: "auditor",
-      message: `${audit.name} completed (real engine) — score ${auditScore}, ${inv.findings.length} findings, parity ${parityScore}%`,
+      await tx
+        .update(audits)
+        .set({
+          status: "completed",
+          score: auditScore,
+          findingsCount: counts,
+          artifactNames: [...stages[0].artifacts, ...stages[1].artifacts, ...stages[2].artifacts],
+          finishedAt: new Date(),
+          stages,
+        })
+        .where(eq(audits.id, auditId));
+
+      await tx.insert(events).values({
+        type: "audit.completed",
+        severity: "success",
+        source: "auditor",
+        message: `${audit.name} completed (real engine) — score ${auditScore}, ${inv.findings.length} findings, parity ${parityScore}%`,
+      });
+
+      /* The owning job finishes with the audit — previously audit.run jobs were
+         skipped by the job runner and stayed `running` forever. */
+      if (jobId) {
+        await tx
+          .update(jobs)
+          .set({ status: "completed", progress: 100, finishedAt: new Date(), heartbeatAt: new Date(), updatedAt: new Date() })
+          .where(eq(jobs.id, jobId));
+      }
     });
 
     await db.insert(approvals).values({
@@ -410,15 +445,6 @@ export async function runRealAudit(auditId: string, jobId?: string): Promise<voi
       resourceId: auditId,
       detail: { engine: "real", score: auditScore, parityScore, findings: counts, scanners: results.length },
     });
-
-    /* The owning job finishes with the audit — previously audit.run jobs were
-       skipped by the job runner and stayed `running` forever. */
-    if (jobId) {
-      await db
-        .update(jobs)
-        .set({ status: "completed", progress: 100, finishedAt: new Date(), heartbeatAt: new Date(), updatedAt: new Date() })
-        .where(eq(jobs.id, jobId));
-    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const idx = stages.findIndex((s) => s.status === "active");

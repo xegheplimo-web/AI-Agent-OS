@@ -1,7 +1,10 @@
 # ---- deps ----
 FROM node:22-alpine AS deps
 WORKDIR /app
-COPY package.json package-lock.json* ./
+# package-lock.json MUST exist — `npm ci` refuses to run without it and the
+# whole point of a lockfile is a deterministic install. The `*` glob let a
+# missing lockfile slip through silently for too long.
+COPY package.json package-lock.json ./
 RUN npm ci
 
 # ---- build ----
@@ -26,6 +29,11 @@ COPY --from=builder --chown=agentos:agentos /app/.next/static ./.next/static
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=builder /app/src ./src
 COPY --from=builder /app/tsconfig.json ./tsconfig.json
+# drizzle-kit needs its config + package.json to read the DATABASE_URL
+# datasource. Without these the `migrate` compose service (which runs
+# `drizzle-kit push` against this image) has nothing to read and fails.
+COPY --from=builder /app/drizzle.config.ts ./drizzle.config.ts
+COPY --from=builder /app/package.json ./package.json
 
 USER agentos
 EXPOSE 3000

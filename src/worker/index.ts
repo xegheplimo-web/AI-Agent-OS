@@ -24,7 +24,13 @@ async function main() {
     `[worker] ${workerId} started · APP_MODE=${APP_MODE} · engine=${isDemoMode ? "demo-timeline" : "real-auditor"}`,
   );
 
-  /** Claim queued work atomically; other workers skip locked rows. */
+  /** Claim queued work atomically; other workers skip locked rows.
+   *
+   * Claims exactly ONE job per tick. The worker processes jobs sequentially,
+   * so claiming three at once would leave two of them sitting in `running`
+   * without a heartbeat — the stale supervisor would then requeue them before
+   * they ever get processed. Once a real concurrency pool exists, raise the
+   * limit again. */
   const claimJobs = async () => {
     const res = await pool.query(
       `UPDATE jobs
@@ -36,7 +42,7 @@ async function main() {
           WHERE status='queued' AND attempt < max_attempts
           ORDER BY created_at
           FOR UPDATE SKIP LOCKED
-          LIMIT 3
+          LIMIT 1
        )
        RETURNING id, type, target`,
       [workerId],
@@ -44,6 +50,7 @@ async function main() {
     for (const row of res.rows as Array<{ type: string; target: string }>) {
       console.log(`[worker] claimed ${row.type} → ${row.target}`);
     }
+    return res.rows as Array<{ id: string; type: string; target: string }>;
   };
 
   let beats = 0;
@@ -67,7 +74,11 @@ async function main() {
         const requeued = await requeueStaleJobs();
         if (requeued) console.log(`[worker] recovered ${requeued} stale job(s)`);
       }
-      if (beats % 8 === 0) await sampleTelemetryOnce();
+      /* Synthetic random-walk telemetry is a DEMO affordance only. Running it
+         in production would seed the database with fabricated metrics that
+         look real — false provenance. Production telemetry must come from a
+         real OTLP collector; until one is wired in, the absence is honest. */
+      if (isDemoMode && beats % 8 === 0) await sampleTelemetryOnce();
     } catch (err) {
       console.error("[worker] tick error:", err);
     } finally {

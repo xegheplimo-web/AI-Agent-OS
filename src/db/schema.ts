@@ -11,6 +11,7 @@ import {
   uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
+import { GENERATOR_VERSION } from "@/lib/version";
 
 /* Indexes below were added in response to a real auditor finding:
    "19 cột hot path chưa có index" (database-inventory scanner, pg_indexes).
@@ -114,6 +115,12 @@ export const findings = pgTable("findings", {
 /* ------------------------------------------------------------------ */
 export const parityReports = pgTable("parity_reports", {
   id: uuid("id").primaryKey().defaultRandom(),
+  /** The audit this report was produced by. Previously NULL for every row, so
+   *  a retried audit inserted a second report and the "latest parity" query
+   *  could return either one. Now required for auditor-generated reports and
+   *  protected by a partial unique index so a re-run upserts instead of
+   *  duplicating. */
+  auditId: uuid("audit_id").references(() => audits.id, { onDelete: "cascade" }),
   overallStatus: text("overall_status").notNull().default("passed"), // passed | warning | failed
   score: integer("score").notNull().default(100),
   environment: text("environment").notNull().default("production"),
@@ -134,7 +141,14 @@ export const parityReports = pgTable("parity_reports", {
     .$type<Array<{ key: string; label: string; status: string }>>()
     .default([]),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-}, (t) => [index("parity_created_at_idx").on(t.createdAt)]);
+}, (t) => [
+  index("parity_created_at_idx").on(t.createdAt),
+  index("parity_audit_id_idx").on(t.auditId),
+  /* At most one parity report per audit: a retried run upserts instead of
+     creating a second row that drifts the "latest parity" result. Only
+     enforced when audit_id IS NOT NULL (global/manual reports stay allowed). */
+  uniqueIndex("parity_audit_uidx").on(t.auditId).where(sql`${t.auditId} IS NOT NULL`),
+]);
 
 /* ------------------------------------------------------------------ */
 /* Telemetry time series                                               */
@@ -223,7 +237,7 @@ export const artifacts = pgTable("artifacts", {
   sha256: text("sha256").notNull().default(""),
   schemaVersion: text("schema_version").notNull().default("1.0"),
   generator: text("generator").notNull().default("ai-system-auditor"),
-  generatorVersion: text("generator_version").notNull().default("0.3.1"),
+  generatorVersion: text("generator_version").notNull().default(GENERATOR_VERSION),
   environment: text("environment").notNull().default("production"),
   content: text("content").notNull().default(""),
   tags: jsonb("tags").$type<string[]>().default([]),
@@ -235,6 +249,11 @@ export const artifacts = pgTable("artifacts", {
   index("artifacts_kind_idx").on(t.kind),
   /* Resume-safe: re-running a stage overwrites the artifact in place. */
   uniqueIndex("artifacts_audit_path_uidx").on(t.auditId, t.path),
+  /* Global artifacts (audit_id IS NULL) — Postgres treats NULLs as distinct
+     in a plain unique index, so without this a retry of a global export (e.g.
+     /audit/exports/sbom.cyclonedx.json) would insert a duplicate row. The
+     partial index closes that gap for the NULL-audit case. */
+  uniqueIndex("artifacts_global_path_uidx").on(t.path).where(sql`${t.auditId} IS NULL`),
 ]);
 
 /* ------------------------------------------------------------------ */
