@@ -51,6 +51,16 @@ export const SESSION_COOKIE = "aos_session";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 
 /* ---------------- password hashing ---------------- */
+
+/** Constant-time string comparison to prevent timing oracle attacks on
+ *  service tokens. Falls back to length check + timingSafeEqual on the
+ *  raw bytes, matching the pattern used for passwords and cookie sigs. */
+function safeEqual(a: string, b: string): boolean {
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ba.length === bb.length && timingSafeEqual(ba, bb);
+}
+
 export function hashPassword(password: string): string {
   const salt = randomBytes(16).toString("hex");
   const hash = scryptSync(password, salt, 64).toString("hex");
@@ -169,7 +179,7 @@ export async function getActor(req: Request): Promise<Actor | null> {
       [process.env.API_INTERNAL_TOKEN, "worker-service", "internal-service"],
     ];
     for (const [expected, role, id] of tokenRoles) {
-      if (expected && expected.length >= 16 && serviceToken === expected) {
+      if (expected && expected.length >= 16 && safeEqual(serviceToken, expected)) {
         return { type: "service", id, displayName: id, role, permissions: ROLE_PERMISSIONS[role] };
       }
     }

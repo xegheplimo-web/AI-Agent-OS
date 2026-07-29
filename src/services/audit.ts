@@ -1,4 +1,4 @@
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { approvals, audits, events, findings, jobs, parityReports } from "@/db/schema";
 import {
@@ -98,12 +98,16 @@ export async function startAudit(input: RunAuditRequest, actor: Actor | null): P
     if (existing.length) return { kind: "started", audit: serializeAudit(existing[0]), replayed: true };
   }
 
-  const running = await db
+  /* Block new audits while one is already running OR waiting for approval.
+     Previously only "running" was checked, so a second request could start
+     while the first was still pending administrator approval — both would
+     eventually try to enqueue a job for the same audit. */
+  const active = await db
     .select()
     .from(audits)
-    .where(eq(audits.status, "running"))
+    .where(inArray(audits.status, ["running", "waiting_approval"]))
     .limit(1);
-  if (running.length) return { kind: "conflict", auditId: running[0].id };
+  if (active.length) return { kind: "conflict", auditId: active[0].id };
 
   const count = (await db.select({ c: sql<number>`count(*)` }).from(audits))[0]?.c ?? 0;
   const d = new Date();
