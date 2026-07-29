@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Agent OS — Đang khởi động…</title>
+<style>
+  * { margin: 0; box-sizing: border-box; }
+  body {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: #020713;
+    color: #e9f6ff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    overflow: hidden;
+  }
+  .vignette {
+    position: fixed; inset: 0;
+    background: radial-gradient(ellipse at center, transparent 50%, rgba(0,0,0,0.55) 100%);
+    pointer-events: none;
+  }
+  .grid {
+    position: fixed; inset: 0;
+    background:
+      linear-gradient(rgba(45,140,220,0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(45,140,220,0.04) 1px, transparent 1px);
+    background-size: 42px 42px;
+    pointer-events: none;
+  }
+  .hex {
+    position: relative;
+    width: 88px; height: 88px;
+    margin-bottom: 28px;
+  }
+  .hex svg { width: 100%; height: 100%; }
+  .ring {
+    position: absolute; inset: -16px;
+    border-radius: 50%;
+    border: 1.5px dashed rgba(55,214,255,0.35);
+    animation: spin 18s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse { 0%,100% { opacity: 0.7; } 50% { opacity: 1; } }
+  @keyframes dots { 0% { content: "."; } 33% { content: ".."; } 66% { content: "..."; } }
+  h1 {
+    font-size: 26px; font-weight: 700; letter-spacing: 0.08em;
+    background: linear-gradient(180deg, #fff 8%, #bfe6ff 50%, #3187ff 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    filter: drop-shadow(0 0 18px rgba(55,160,255,0.5));
+    margin-bottom: 10px;
+  }
+  .sub {
+    font-size: 11px; letter-spacing: 0.28em; text-transform: uppercase;
+    color: rgba(120,180,220,0.7);
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  .sub::after { content: "..."; animation: dots 1.5s step-end infinite; }
+  .status {
+    position: fixed; bottom: 24px; left: 0; right: 0;
+    text-align: center;
+    font-family: ui-monospace, "SF Mono", monospace;
+    font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase;
+    color: rgba(120,144,170,0.65);
+  }
+  .status span { color: #37d6ff; }
+</style>
+</head>
+<body>
+  <div class="vignette"></div>
+  <div class="grid"></div>
+  <div class="hex">
+    <div class="ring"></div>
+    <svg viewBox="0 0 128 128" fill="none">
+      <defs>
+        <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="#7fe6ff"/>
+          <stop offset="0.55" stop-color="#37d6ff"/>
+          <stop offset="1" stop-color="#3187ff"/>
+        </linearGradient>
+      </defs>
+      <g stroke="url(#g)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"
+         style="filter:drop-shadow(0 0 6px rgba(55,214,255,0.7))">
+        <path d="M64 22 L98 42 L98 86 L64 106 L30 86 L30 42 Z"/>
+        <circle cx="64" cy="64" r="17"/>
+        <path d="M64 30 L64 47 M64 81 L64 98 M35 47 L50 56 M78 72 L93 81 M35 81 L50 72 M78 56 L93 47"/>
+      </g>
+    </svg>
+  </div>
+  <h1>AI Agent OS</h1>
+  <div class="sub">Đang khởi động control plane</div>
+  <div class="status">
+    <span id="mode">demo</span> · chờ healthcheck · <span id="port">3000</span>
+  </div>
+  <script>
+    const { listen } = window.__TAURI_INTERNALS__?.event ?? {};
+    if (listen) {
+      listen("control-plane-ready", (e) => {
+        document.querySelector(".sub").textContent = "Đã kết nối — đang mở dashboard";
+        document.querySelector(".sub").style.animation = "none";
+        document.querySelector(".sub").style.color = "#20e3a2";
+      });
+      listen("control-plane-timeout", () => {
+        document.querySelector(".sub").textContent = "Không thể kết nối — kiểm tra PostgreSQL và .env";
+        document.querySelector(".sub").style.animation = "none";
+        document.querySelector(".sub").style.color = "#ff5f7a";
+      });
+    }
+    const params = new URLSearchParams(location.search);
+    const port = params.get("port");
+    const mode = params.get("mode");
+    if (port) document.getElementById("port").textContent = port;
+    if (mode) document.getElementById("mode").textContent = mode;
+  </script>
+</body>
+</html>

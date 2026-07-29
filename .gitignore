@@ -1,0 +1,35 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# next
+.next/
+out/
+build/
+next-env.d.ts
+
+# production data
+data/
+coverage/
+
+# env — keep .env.example tracked
+.env
+.env.local
+.env*.local
+
+# lock file MUST be committed (npm ci in CI + Docker depends on it)
+!package-lock.json
+
+# tauri
+src-tauri/target/
+src-tauri/gen/
+
+# misc
+.DS_Store
+*.pem
+*.log
+npm-debug.log*
+.vercel
+.idea/
+.vscode/
