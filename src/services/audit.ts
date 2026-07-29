@@ -392,13 +392,20 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
   });
   const { score: parityScore, overallStatus } = computeParityScore(checks);
 
-  await db.insert(parityReports).values({
-    overallStatus,
-    score: parityScore,
-    environment: audit?.environment ?? "production",
-    checks,
-    gates: PARITY_GATES.map((g) => ({ ...g })),
-  });
+  await db
+    .insert(parityReports)
+    .values({
+      auditId,
+      overallStatus,
+      score: parityScore,
+      environment: audit?.environment ?? "production",
+      checks,
+      gates: PARITY_GATES.map((g) => ({ ...g })),
+    })
+    .onConflictDoUpdate({
+      target: [parityReports.auditId],
+      set: { overallStatus, score: parityScore, checks, gates: PARITY_GATES.map((g) => ({ ...g })) },
+    });
 
   await db.insert(events).values([
     {

@@ -174,7 +174,7 @@ export function normalize(results: ScanResult[]): NormalizedInventory {
 /* ------------------------------------------------------------------ */
 /* Parity checks computed from the real inventory                      */
 /* ------------------------------------------------------------------ */
-export function parityChecksFrom(inv: NormalizedInventory, latencyP95: number) {
+export function parityChecksFrom(inv: NormalizedInventory, latencyP95: number | null) {
   const routeCount = inv.services.length;
   const guarded = inv.services.filter((s) => (s as { guarded?: boolean }).guarded).length;
   const mutating = inv.services.filter((s) => {
@@ -245,8 +245,14 @@ export function parityChecksFrom(inv: NormalizedInventory, latencyP95: number) {
       key: "p95_latency",
       label: "p95 latency threshold",
       baselineValue: "≤ 150ms",
-      currentValue: `${latencyP95.toFixed(1)}ms`,
-      status: (latencyP95 <= 150 ? "passed" : "warning") as "passed" | "warning",
+      currentValue: latencyP95 === null ? "no data" : `${latencyP95.toFixed(1)}ms`,
+      /* No telemetry must never read as "0ms → passed". Absence of data is
+         not evidence of good latency — it is an unknown, reported as pending
+         so the parity gate cannot go green on a missing signal. */
+      status: (latencyP95 === null ? "pending" : latencyP95 <= 150 ? "passed" : "warning") as
+        | "passed"
+        | "warning"
+        | "pending",
     },
   ];
 }
