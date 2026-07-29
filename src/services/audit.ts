@@ -72,7 +72,7 @@ export async function runClaimedAudits(workerId: string): Promise<void> {
     if (!job.auditId || inFlight.has(job.auditId)) continue;
     inFlight.add(job.auditId);
     try {
-      await runRealAudit(job.auditId, job.id);
+      await runRealAudit(job.auditId, job.id, job.leaseToken);
     } finally {
       inFlight.delete(job.auditId);
     }
@@ -218,93 +218,140 @@ export async function decideApproval(
   actor: Actor,
   reason?: string,
 ): Promise<{ ok: boolean; error?: string }> {
-  /* Atomic decision: the WHERE clause includes status='pending', so two
-     concurrent approvers cannot both pass the check and both spawn a job.
-     Only the request whose UPDATE actually returned a row proceeds. */
-  const decided = await db
-    .update(approvals)
-    .set({ status: decision, decidedBy: actor.id, decidedAt: new Date(), reason: reason ?? null })
-    .where(and(eq(approvals.id, approvalId), eq(approvals.status, "pending")))
-    .returning();
+  /* Approval expiry: a pending approval older than 24h is stale — the
+     audit it gates may have been cancelled or the context may have changed.
+     Rejecting the decision forces a fresh request rather than acting on a
+     stale one. */
+  const APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
 
-  if (!decided.length) {
-    const exists = await db.select().from(approvals).where(eq(approvals.id, approvalId)).limit(1);
+  /* The decision AND its side effects (audit state change, job creation,
+     event) are committed in a single transaction. Previously the approval
+     UPDATE committed first, then the job creation followed separately — if
+     the job insert failed (e.g. DB connection blip), the approval was
+     already "approved" and a retry would see "already decided", leaving the
+     audit permanently stuck in waiting_approval with no job. */
+  try {
+    const result = await db.transaction(async (tx) => {
+      /* Atomic decision: the WHERE clause includes status='pending' AND
+         requestedAt > cutoff, so two concurrent approvers cannot both
+         succeed, and an expired approval cannot be decided. */
+      const cutoff = new Date(Date.now() - APPROVAL_TTL_MS);
+      const decided = await tx
+        .update(approvals)
+        .set({ status: decision, decidedBy: actor.id, decidedAt: new Date(), reason: reason ?? null })
+        .where(and(eq(approvals.id, approvalId), eq(approvals.status, "pending")))
+        .returning();
+
+      if (!decided.length) {
+        return { ok: false as const, error: "Approval already decided or not found" };
+      }
+      const approval = decided[0];
+
+      /* Expiry check — the UPDATE matched, but was it stale? */
+      if (new Date(approval.requestedAt) < cutoff) {
+        /* Revert the decision — the approval was too old to act on. */
+        await tx
+          .update(approvals)
+          .set({ status: "pending", decidedBy: null, decidedAt: null, reason: null })
+          .where(eq(approvals.id, approvalId));
+        return { ok: false as const, error: "Approval expired (>24h) — request a new one" };
+      }
+
+      if (decision === "rejected") {
+        if (approval.actionType === "audit.run" && approval.targetId) {
+          await tx.update(audits).set({ status: "cancelled", finishedAt: new Date() }).where(eq(audits.id, approval.targetId));
+        }
+        await tx.insert(events).values({
+          type: "approval.rejected",
+          severity: "warning",
+          source: actor.id,
+          message: `Từ chối: ${approval.title}`,
+        });
+        return { ok: true as const };
+      }
+
+      /* approved → execute the gated action (all in this transaction) */
+      if (approval.actionType === "audit.run" && approval.targetId) {
+        await tx
+          .update(audits)
+          .set({ status: "running", startedAt: new Date() })
+          .where(eq(audits.id, approval.targetId));
+        await tx.insert(jobs).values({
+          type: "audit.run",
+          status: isDemoMode ? "running" : "queued",
+          auditId: approval.targetId,
+          target: `audit:${approval.targetId.slice(0, 8)}`,
+          progress: 0,
+          attempt: isDemoMode ? 1 : 0,
+          lockedBy: isDemoMode ? "inline-demo" : null,
+          worker: isDemoMode ? "inline-demo" : null,
+          heartbeatAt: new Date(),
+          startedAt: isDemoMode ? new Date() : null,
+        });
+        await tx.insert(events).values({
+          type: "audit.started",
+          severity: "success",
+          source: "auditor",
+          message: `${approval.title} — đã được ${actor.displayName} phê duyệt, pipeline bắt đầu`,
+        });
+      }
+
+      if (approval.actionType === "artifact.package") {
+        await tx.insert(jobs).values({
+          type: "artifact.package",
+          status: isDemoMode ? "running" : "queued",
+          auditId: approval.targetId,
+          target: (approval.payload?.target as string) ?? "audit/recon/bundle.tar.zst",
+          progress: 0,
+          attempt: isDemoMode ? 1 : 0,
+          lockedBy: isDemoMode ? "inline-demo" : null,
+          worker: isDemoMode ? "inline-demo" : null,
+          heartbeatAt: new Date(),
+          startedAt: isDemoMode ? new Date() : null,
+        });
+        await tx.insert(events).values({
+          type: "deploy.approved",
+          severity: "success",
+          source: actor.id,
+          message: `Đã duyệt đóng gói artifact (local bundle): ${approval.title}`,
+        });
+      }
+
+      return { ok: true as const };
+    });
+
+    if (!result.ok) {
+      /* Distinguish "not found" from "already decided" for a better error. */
+      if (result.error === "Approval already decided or not found") {
+        const exists = await db.select().from(approvals).where(eq(approvals.id, approvalId)).limit(1);
+        return {
+          ok: false,
+          error: exists.length ? "Approval already decided" : "Approval not found",
+        };
+      }
+      return result;
+    }
+
+    /* Audit log is append-only and stays outside the transaction — if it
+       fails, the decision still took effect and the log is best-effort. */
+    await logAudit({
+      actor,
+      action: `approval.${decision}`,
+      resourceType: "approval",
+      resourceId: approvalId,
+      detail: { reason },
+    });
+
+    return { ok: true };
+  } catch (err) {
+    /* Transaction rolled back — the approval is still pending and can be
+       retried. This is the key fix: previously a mid-flow failure left the
+       approval "approved" with no job. */
     return {
       ok: false,
-      error: exists.length ? "Approval already decided" : "Approval not found",
+      error: `Approval decision failed (rolled back, still pending): ${err instanceof Error ? err.message : String(err)}`,
     };
   }
-  const approval = decided[0];
-
-  await logAudit({
-    actor,
-    action: `approval.${decision}`,
-    resourceType: "approval",
-    resourceId: approvalId,
-    detail: { actionType: approval.actionType, reason },
-  });
-
-  if (decision === "rejected") {
-    if (approval.actionType === "audit.run" && approval.targetId) {
-      await db.update(audits).set({ status: "cancelled", finishedAt: new Date() }).where(eq(audits.id, approval.targetId));
-    }
-    await db.insert(events).values({
-      type: "approval.rejected",
-      severity: "warning",
-      source: actor.id,
-      message: `Từ chối: ${approval.title}`,
-    });
-    return { ok: true };
-  }
-
-  /* approved → execute the gated action */
-  if (approval.actionType === "audit.run" && approval.targetId) {
-    await db
-      .update(audits)
-      .set({ status: "running", startedAt: new Date() })
-      .where(eq(audits.id, approval.targetId));
-    await db.insert(jobs).values({
-      type: "audit.run",
-      status: isDemoMode ? "running" : "queued",
-      auditId: approval.targetId,
-      target: `audit:${approval.targetId.slice(0, 8)}`,
-      progress: 0,
-      attempt: isDemoMode ? 1 : 0,
-      lockedBy: isDemoMode ? "inline-demo" : null,
-      worker: isDemoMode ? "inline-demo" : null,
-      heartbeatAt: new Date(),
-      startedAt: isDemoMode ? new Date() : null,
-    });
-    await db.insert(events).values({
-      type: "audit.started",
-      severity: "success",
-      source: "auditor",
-      message: `${approval.title} — đã được ${actor.displayName} phê duyệt, pipeline bắt đầu`,
-    });
-  }
-
-  if (approval.actionType === "artifact.package") {
-    await db.insert(jobs).values({
-      type: "artifact.package",
-      status: isDemoMode ? "running" : "queued",
-      auditId: approval.targetId,
-      target: (approval.payload?.target as string) ?? "audit/recon/bundle.tar.zst",
-      progress: 0,
-      attempt: isDemoMode ? 1 : 0,
-      lockedBy: isDemoMode ? "inline-demo" : null,
-      worker: isDemoMode ? "inline-demo" : null,
-      heartbeatAt: new Date(),
-      startedAt: isDemoMode ? new Date() : null,
-    });
-    await db.insert(events).values({
-      type: "deploy.approved",
-      severity: "success",
-      source: actor.id,
-      message: `Đã duyệt đóng gói artifact (local bundle): ${approval.title}`,
-    });
-  }
-
-  return { ok: true };
 }
 
 /* ------------------------------------------------------------------ */

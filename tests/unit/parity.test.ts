@@ -84,6 +84,32 @@ describe("parityChecksFrom — p95 latency truthfulness", () => {
   });
 });
 
+describe("parityChecksFrom — no false-green on unmeasured checks", () => {
+  it("golden_tests is pending (auditor does not run the test suite)", () => {
+    const checks = parityChecksFrom(baseInventory, 120);
+    const golden = checks.find((c) => c.key === "golden_tests");
+    expect(golden?.status).toBe("pending");
+  });
+
+  it("port_map is pending (no real port scan)", () => {
+    const checks = parityChecksFrom(baseInventory, 120);
+    const port = checks.find((c) => c.key === "port_map");
+    expect(port?.status).toBe("pending");
+  });
+
+  it("ui_critical_paths is pending (no UI test runner)", () => {
+    const checks = parityChecksFrom(baseInventory, 120);
+    const ui = checks.find((c) => c.key === "ui_critical_paths");
+    expect(ui?.status).toBe("pending");
+  });
+
+  it("the overall parity cannot be 'passed' when unmeasured checks are pending", () => {
+    const checks = parityChecksFrom(baseInventory, 120);
+    const { overallStatus } = computeParityScore(checks);
+    expect(overallStatus).not.toBe("passed");
+  });
+});
+
 describe("diffParityChecks", () => {
   it("reports only changed checks", () => {
     const before = [

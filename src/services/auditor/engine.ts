@@ -143,7 +143,7 @@ async function persistArtifact(params: {
  * Resume-safe: findings and artifacts are upserted on their unique keys, so
  * a crashed run that is retried rewrites rows instead of duplicating them.
  */
-export async function runRealAudit(auditId: string, jobId?: string): Promise<void> {
+export async function runRealAudit(auditId: string, jobId?: string, leaseToken?: string | null): Promise<void> {
   const rows = await db.select().from(audits).where(eq(audits.id, auditId)).limit(1);
   if (!rows.length) return;
   const audit = rows[0];
@@ -419,12 +419,24 @@ export async function runRealAudit(auditId: string, jobId?: string): Promise<voi
       });
 
       /* The owning job finishes with the audit — previously audit.run jobs were
-         skipped by the job runner and stayed `running` forever. */
+         skipped by the job runner and stayed `running` forever.
+         Lease fencing: the update only matches if lease_token still equals the
+         token this worker was given at claim time. If a stale supervisor
+         requeued the job (clearing lease_token) and another worker claimed it,
+         this update matches 0 rows — the worker lost ownership and must not
+         finalize. We detect the 0-row case and abort the transaction. */
       if (jobId) {
-        await tx
+        const leaseFilter = leaseToken
+          ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken))
+          : eq(jobs.id, jobId);
+        const finalized = await tx
           .update(jobs)
           .set({ status: "completed", progress: 100, finishedAt: new Date(), heartbeatAt: new Date(), updatedAt: new Date() })
-          .where(eq(jobs.id, jobId));
+          .where(leaseFilter)
+          .returning({ id: jobs.id });
+        if (leaseToken && !finalized.length) {
+          throw new Error("LEASE_LOST: job was requeued by the stale supervisor before this worker could finalize — aborting to avoid duplicate completion");
+        }
       }
     });
 
@@ -455,15 +467,21 @@ export async function runRealAudit(auditId: string, jobId?: string): Promise<voi
       .where(eq(audits.id, auditId));
 
     if (jobId) {
-      /* Let the queue decide: retry while attempts remain, otherwise fail. */
+      /* Let the queue decide: retry while attempts remain, otherwise fail.
+         Lease fencing: only update if we still own the job. If the stale
+         supervisor already requeued it, our update is a no-op. */
       const jobRows = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
       const job = jobRows[0];
       const exhausted = !job || job.attempt >= job.maxAttempts;
+      const leaseFilter = leaseToken
+        ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken))
+        : eq(jobs.id, jobId);
       await db
         .update(jobs)
         .set({
           status: exhausted ? "failed" : "queued",
           lockedBy: null,
+          leaseToken: null,
           worker: exhausted ? job?.worker : null,
           progress: exhausted ? job?.progress ?? 0 : 0,
           errorCode: "AUDIT_ENGINE_ERROR",
@@ -471,7 +489,7 @@ export async function runRealAudit(auditId: string, jobId?: string): Promise<voi
           finishedAt: exhausted ? new Date() : null,
           updatedAt: new Date(),
         })
-        .where(eq(jobs.id, jobId));
+        .where(leaseFilter);
 
       /* A retryable job puts the audit back in the runnable state — but only
          if a concurrent requeueStaleJobs hasn't already timed out the job.
