@@ -693,18 +693,14 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
        Inside the transaction so the demo path matches production — the audit
        cannot end up completed with no packaging approval. Only created when
        parity is "passed" or "warning" — a "failed" parity blocks packaging. */
-    await tx.insert(approvals).values({
-      actionType: "artifact.package",
-      targetType: "audit",
-      targetId: auditId,
-      title: `Package reconstruction bundle của ${audit?.name ?? "audit"} (local artifact)${overallStatus === "warning" ? " [parity warning]" : ""}`,
-      environment: audit?.environment ?? "production",
-      requestedBy: "auditor-service",
-      payload: { auditId, target: "audit/recon/bundle.tar.zst", parityStatus: overallStatus },
-    }).onConflictDoNothing({
-      target: [approvals.actionType, approvals.targetId],
-      where: sql`status = 'pending'`,
-    });
+    await tx.execute(sql`
+      INSERT INTO approvals (id, action_type, target_type, target_id, title, status, environment, requested_by, payload)
+      VALUES (gen_random_uuid(), 'artifact.package', 'audit', ${auditId},
+              ${`Package reconstruction bundle của ${audit?.name ?? "audit"} (local artifact)${overallStatus === "warning" ? " [parity warning]" : ""}`},
+              'pending', ${audit?.environment ?? "production"}, 'auditor-service',
+              ${JSON.stringify({ auditId, target: "audit/recon/bundle.tar.zst", parityStatus: overallStatus })}::jsonb)
+      ON CONFLICT (action_type, target_id) WHERE status = 'pending' DO NOTHING
+    `);
 
     await tx
       .update(jobs)

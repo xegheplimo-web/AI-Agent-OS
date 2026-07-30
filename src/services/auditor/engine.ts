@@ -570,18 +570,18 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
          window where a crash orphaned the approval or the completed audit.
          Parity gate: only created when parity is "passed" or "warning" —
          a "failed" parity blocks packaging (see above). */
-      await tx.insert(approvals).values({
-        actionType: "artifact.package",
-        targetType: "audit",
-        targetId: auditId,
-        title: `Package reconstruction bundle của ${audit.name} (local artifact)${overallStatus === "warning" ? " [parity warning]" : ""}`,
-        environment,
-        requestedBy: "auditor-service",
-        payload: { auditId, target: "audit/recon/bundle.tar.zst", parityStatus: overallStatus },
-      }).onConflictDoNothing({
-        target: [approvals.actionType, approvals.targetId],
-        where: sql`status = 'pending'`,
-      });
+      /* Use raw SQL for the partial-index conflict target — drizzle's
+         onConflictDoNothing doesn't generate the WHERE clause correctly
+         for partial unique indexes. ON CONFLICT (cols) WHERE cond DO
+         NOTHING requires the WHERE to match the index predicate exactly. */
+      await tx.execute(sql`
+        INSERT INTO approvals (id, action_type, target_type, target_id, title, status, environment, requested_by, payload)
+        VALUES (gen_random_uuid(), 'artifact.package', 'audit', ${auditId},
+                ${`Package reconstruction bundle của ${audit.name} (local artifact)${overallStatus === "warning" ? " [parity warning]" : ""}`},
+                'pending', ${environment}, 'auditor-service',
+                ${JSON.stringify({ auditId, target: "audit/recon/bundle.tar.zst", parityStatus: overallStatus })}::jsonb)
+        ON CONFLICT (action_type, target_id) WHERE status = 'pending' DO NOTHING
+      `);
     });
 
     await logAudit({
