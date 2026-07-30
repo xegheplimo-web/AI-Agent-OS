@@ -1,8 +1,8 @@
-# AI Agent OS ΓÇö Push Workflow
+# AI Agent OS — Push Workflow
 
-Quy tr├¼nh ─æß║⌐y code l├¬n GitHub. L├ám theo c├íc b╞░ß╗¢c theo thß╗⌐ tß╗▒.
+Quy trình đẩy code lên GitHub. Làm theo các bước theo thứ tự.
 
-## 1. Kiß╗âm tra trß║íng th├íi
+## 1. Kiểm tra trạng thái
 
 ```bash
 git status
@@ -10,54 +10,54 @@ git remote -v
 git branch --show-current
 ```
 
-X├íc nhß║¡n:
-- Branch ─æ├║ng (`audit/current-state` hoß║╖c branch ─æang l├ám viß╗çc)
-- Remote ─æ├║ng (`origin ΓåÆ https://github.com/xegheplimo-web/AI-Agent-OS.git`)
-- Kh├┤ng c├│ file `.env` trong untracked (chß╗ë `.env.example` ─æ╞░ß╗úc track)
+Xác nhận:
+- Branch đúng (`audit/current-state` hoặc branch đang làm việc)
+- Remote đúng (`origin → https://github.com/xegheplimo-web/AI-Agent-OS.git`)
+- Không có file `.env` trong untracked (chỉ `.env.example` được track)
 
-## 2. Scan secret tr╞░ß╗¢c khi commit
+## 2. Scan secret trước khi commit
 
 ```bash
-# Grep nhanh pattern secret thß║¡t (kh├┤ng phß║úi placeholder change-me)
+# Grep nhanh pattern secret thật (không phải placeholder change-me)
 rg -i "(api_key|secret_key|private_key|BEGIN RSA|BEGIN PRIVATE|ghp_[a-zA-Z0-9]{36}|sk-[a-zA-Z0-9]{20,})" src/ scripts/ tests/ --glob '!*.example'
 ```
 
-Quy tß║»c:
-- `change-me-*` trong `.env.example` v├á `docker-compose.yml` ΓåÆ **OK** (placeholder, kh├┤ng phß║úi secret thß║¡t)
-- `hashPassword("AgentOS#admin")` trong `seed.ts` ΓåÆ **OK** (demo seed, hash bß║▒ng scrypt)
-- Pattern `BEGIN PRIVATE KEY` trong `scanners.ts` ΓåÆ **OK** (redaction regex, kh├┤ng phß║úi key thß║¡t)
-- Bß║Ñt kß╗│ match n├áo kh├íc ΓåÆ **Dß╗¬NG**, kiß╗âm tra thß╗º c├┤ng tr╞░ß╗¢c khi commit
+Quy tắc:
+- `change-me-*` trong `.env.example` và `docker-compose.yml` → **OK** (placeholder, không phải secret thật)
+- `hashPassword("AgentOS#admin")` trong `seed.ts` → **OK** (demo seed, hash bằng scrypt)
+- Pattern `BEGIN PRIVATE KEY` trong `scanners.ts` → **OK** (redaction regex, không phải key thật)
+- Bất kỳ match nào khác → **DỪNG**, kiểm tra thủ công trước khi commit
 
-## 3. Stage thay ─æß╗òi
+## 3. Stage thay đổi
 
 ```bash
-# Stage tß║Ñt cß║ú: x├│a file c┼⌐ + th├¬m file mß╗¢i + sß╗¡a file
+# Stage tất cả: xóa file cũ + thêm file mới + sửa file
 git add -A
 
-# Hoß║╖c stage c├│ chß╗ìn lß╗ìc:
+# Hoặc stage có chọn lọc:
 git add src/ tests/ scripts/ Dockerfile docker-compose.yml ...
-git rm <files ─æ├ú x├│a>
+git rm <files đã xóa>
 ```
 
-## 4. Kiß╗âm tra diff tr╞░ß╗¢c khi commit
+## 4. Kiểm tra diff trước khi commit
 
 ```bash
-git diff --cached --stat          # tß╗òng quan
+git diff --cached --stat          # tổng quan
 git diff --cached --name-status   # file-level: A/M/D
 ```
 
-X├íc nhß║¡n:
-- Sß╗æ file th├¬m/x├│a/sß╗¡a ─æ├║ng nh╞░ mong ─æß╗úi
-- Kh├┤ng c├│ file `.env` trong staged
-- Kh├┤ng c├│ `node_modules/`, `.next/`, `data/` (─æ├ú exclude trong .gitignore)
+Xác nhận:
+- Số file thêm/xóa/sửa đúng như mong đợi
+- Không có file `.env` trong staged
+- Không có `node_modules/`, `.next/`, `data/` (đã exclude trong .gitignore)
 
 ## 5. Commit
 
 ```bash
 git commit -m "$(cat <<'EOF'
-<m├┤ tß║ú ngß║»n gß╗ìn thay ─æß╗òi>
+<mô tả ngắn gọn thay đổi>
 
-<chi tiß║┐t th├¬m nß║┐u cß║ºn>
+<chi tiết thêm nếu cần>
 
 Generated with [Devin](https://devin.ai)
 
@@ -69,14 +69,14 @@ EOF
 ## 6. Push
 
 ```bash
-# Push l├¬n branch hiß╗çn tß║íi
+# Push lên branch hiện tại
 git push origin <branch>
 
-# Hoß║╖c push branch mß╗¢i + set upstream
+# Hoặc push branch mới + set upstream
 git push -u origin <new-branch>
 ```
 
-## 7. Tß║ío PR (nß║┐u cß║ºn)
+## 7. Tạo PR (nếu cần)
 
 ```bash
 gh pr create --title "title" --body "$(cat <<'EOF'
@@ -91,29 +91,29 @@ EOF
 )"
 ```
 
-## L╞░u ├╜ quan trß╗ìng
+## Lưu ý quan trọng
 
-- **`.env` kh├┤ng bao giß╗¥ commit** ΓÇö `.gitignore` ─æ├ú exclude, chß╗ë track `.env.example`
-- **`package-lock.json` phß║úi commit** ΓÇö `.gitignore` c├│ `!package-lock.json` ─æß╗â override
-- **`node_modules/`, `.next/`, `data/`** ─æ├ú exclude trong `.gitignore`
-- **Secret thß║¡t** (GitHub token, API key, SSH key) kh├┤ng ─æ╞░ß╗úc ph├⌐p trong code ΓÇö d├╣ng env var
-- **Pre-commit hooks** nß║┐u c├│ sß║╜ chß║íy tß╗▒ ─æß╗Öng; nß║┐u sß╗¡a file, `git add` lß║íi rß╗ôi commit lß║íi
+- **`.env` không bao giờ commit** — `.gitignore` đã exclude, chỉ track `.env.example`
+- **`package-lock.json` phải commit** — `.gitignore` có `!package-lock.json` để override
+- **`node_modules/`, `.next/`, `data/`** đã exclude trong `.gitignore`
+- **Secret thật** (GitHub token, API key, SSH key) không được phép trong code — dùng env var
+- **Pre-commit hooks** nếu có sẽ chạy tự động; nếu sửa file, `git add` lại rồi commit lại
 
-## Cß║Ñu tr├║c repo hiß╗çn tß║íi
+## Cấu trúc repo hiện tại
 
 ```
 AI-Agent-OS/
-Γö£ΓöÇΓöÇ src/                    # Next.js control plane (App Router)
-Γöé   Γö£ΓöÇΓöÇ app/api/            # API routes (audits, findings, jobs, approvals, ...)
-Γöé   Γö£ΓöÇΓöÇ db/                 # Drizzle ORM schema + seed
-Γöé   Γö£ΓöÇΓöÇ lib/                # auth, contracts (Zod), types, utils
-Γöé   Γö£ΓöÇΓöÇ services/           # audit engine, jobs queue, telemetry, worker
-Γöé   ΓööΓöÇΓöÇ worker/             # external worker process
-Γö£ΓöÇΓöÇ tests/                  # vitest unit tests
-Γö£ΓöÇΓöÇ scripts/                # verify-real-engine.ts, verify-worker.ts
-Γö£ΓöÇΓöÇ src-tauri/              # Tauri desktop shell (Rust)
-Γö£ΓöÇΓöÇ .github/workflows/ci.yml
-Γö£ΓöÇΓöÇ Dockerfile + docker-compose.yml
-Γö£ΓöÇΓöÇ package.json + tsconfig.json + vitest.config.ts
-ΓööΓöÇΓöÇ .env.example
+├── src/                    # Next.js control plane (App Router)
+│   ├── app/api/            # API routes (audits, findings, jobs, approvals, ...)
+│   ├── db/                 # Drizzle ORM schema + seed
+│   ├── lib/                # auth, contracts (Zod), types, utils
+│   ├── services/           # audit engine, jobs queue, telemetry, worker
+│   └── worker/             # external worker process
+├── tests/                  # vitest unit tests
+├── scripts/                # verify-real-engine.ts, verify-worker.ts
+├── src-tauri/              # Tauri desktop shell (Rust)
+├── .github/workflows/ci.yml
+├── Dockerfile + docker-compose.yml
+├── package.json + tsconfig.json + vitest.config.ts
+└── .env.example
 ```
