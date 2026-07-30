@@ -578,6 +578,9 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
         environment,
         requestedBy: "auditor-service",
         payload: { auditId, target: "audit/recon/bundle.tar.zst", parityStatus: overallStatus },
+      }).onConflictDoNothing({
+        target: [approvals.actionType, approvals.targetId],
+        targetWhere: sql`status = 'pending'`,
       });
     });
 
