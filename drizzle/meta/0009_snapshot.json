@@ -1,6 +1,6 @@
 {
-  "id": "0cf4dcb5-5805-46e4-9a4a-065d08420490",
-  "prevId": "f1c5aef3-5e7b-4771-a10d-95b775767e73",
+  "id": "95493e8f-540c-4d5d-aee6-207d85a9631b",
+  "prevId": "0cf4dcb5-5805-46e4-9a4a-065d08420490",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -611,6 +611,16 @@
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false
+        },
+        "active_bucket": {
+          "name": "active_bucket",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "generated": {
+            "as": "CASE WHEN \"status\" IN ('running', 'waiting_approval') THEN 'active' ELSE NULL END",
+            "type": "stored"
+          }
         }
       },
       "indexes": {
@@ -679,14 +689,14 @@
           "name": "audits_active_uidx",
           "columns": [
             {
-              "expression": "CASE WHEN \"status\" = 'running' THEN 'active' WHEN \"status\" = 'waiting_approval' THEN 'active' ELSE \"status\" END",
+              "expression": "active_bucket",
+              "isExpression": false,
               "asc": true,
-              "isExpression": true,
               "nulls": "last"
             }
           ],
           "isUnique": true,
-          "where": "\"audits\".\"status\" IN ('running', 'waiting_approval')",
+          "where": "\"audits\".\"active_bucket\" IS NOT NULL",
           "concurrently": false,
           "method": "btree",
           "with": {}

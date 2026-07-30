@@ -70,6 +70,13 @@ export const audits = pgTable("audits", {
   idempotencyKey: text("idempotency_key"),
   startedAt: timestamp("started_at", { withTimezone: true }).defaultNow().notNull(),
   finishedAt: timestamp("finished_at", { withTimezone: true }),
+  /* Generated column: 'active' when status is running/waiting_approval,
+     NULL otherwise. Backs the audits_active_uidx partial unique index so
+     only one audit may be active at a time. Stored (not virtual) so the
+     index can use it without recomputing the expression. */
+  activeBucket: text("active_bucket").generatedAlwaysAs(
+    sql`CASE WHEN "status" IN ('running', 'waiting_approval') THEN 'active' ELSE NULL END`,
+  ).notNull(),
 }, (t) => [
   index("audits_status_idx").on(t.status),
   index("audits_started_at_idx").on(t.startedAt),
@@ -82,12 +89,16 @@ export const audits = pgTable("audits", {
      The partial index makes the intent explicit and the constraint airtight. */
   uniqueIndex("audits_idempotency_uidx").on(t.idempotencyKey).where(sql`${t.idempotencyKey} IS NOT NULL`),
   /* UNIQUE partial index: at most ONE audit may be in an active state
-     (running OR waiting_approval) at any time. The index keys on a constant
-     expression (1) so every active row collides on the same key — a second
-     concurrent insert fails with a unique violation, closing the SELECT-then-
-     INSERT race in startAudit (two requests with different idempotency keys
-     both passing the active check and both inserting). */
-  uniqueIndex("audits_active_uidx").on(sql`1`).where(sql`${t.status} IN ('running', 'waiting_approval')`),
+     (running OR waiting_approval) at any time. Uses the `status` column
+     directly as the index key with a partial WHERE clause. Since both
+     'running' and 'waiting_approval' are distinct values, a plain unique
+     index on `status` would allow one 'running' AND one 'waiting_approval'
+     to coexist. To collapse both into a single bucket, we add a generated
+     column `active_bucket` that is 'active' for both active states and
+     NULL otherwise, then unique-index it WHERE NOT NULL. A second
+     concurrent insert of any active audit fails with a unique violation,
+     closing the SELECT-then-INSERT race in startAudit. */
+  uniqueIndex("audits_active_uidx").on(t.activeBucket).where(sql`${t.activeBucket} IS NOT NULL`),
 ]);
 
 /* ------------------------------------------------------------------ */
