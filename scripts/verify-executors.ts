@@ -22,8 +22,8 @@ function check(name: string, ok: boolean, detail?: string) {
 
 async function main() {
   const { db, closeDb } = await import("../src/db");
-  const { audits, artifacts, parityReports, settings, jobs } = await import("../src/db/schema");
-  const { eq, desc } = await import("drizzle-orm");
+  const { audits, artifacts, parityReports, settings, jobs, telemetryPoints } = await import("../src/db/schema");
+  const { eq, desc, sql, and } = await import("drizzle-orm");
   const { createHash } = await import("node:crypto");
   const { runExecutor } = await import("../src/services/executors");
 
@@ -83,6 +83,11 @@ async function main() {
 
   /* ---------- 2. parity.gate ---------- */
   try {
+    /* Wipe telemetry so p95_latency has no data — the parity gate must
+       report it as "pending", not "passed" (no false-green on missing
+       signal). Seed inserts latency_p95=128ms which would make it pass,
+       defeating the purpose of this check. */
+    await db.delete(telemetryPoints).where(sql`true`);
     await runExecutor(jobRow("parity.gate", audit.id) as never);
     const [report] = await db.select().from(parityReports).where(eq(parityReports.auditId, audit.id)).orderBy(desc(parityReports.createdAt)).limit(1);
     check("parity.gate persisted a parity report for the audit", !!report, report ? `${report.score}/${report.overallStatus}` : "no row");
@@ -97,13 +102,13 @@ async function main() {
   /* ---------- 3. artifact.package ---------- */
   try {
     await runExecutor(jobRow("artifact.package", audit.id) as never);
-    const bundle = await db.select().from(artifacts).where(eq(artifacts.path, "/audit/exports/bundle.tar")).orderBy(desc(artifacts.updatedAt)).limit(1);
-    const checksumRow = await db.select().from(artifacts).where(eq(artifacts.path, "/audit/exports/bundle.tar.sha256")).limit(1);
+    const bundle = await db.select().from(artifacts).where(and(eq(artifacts.path, "/audit/exports/bundle.tar"), eq(artifacts.auditId, audit.id))).orderBy(desc(artifacts.updatedAt)).limit(1);
+    const checksumRow = await db.select().from(artifacts).where(and(eq(artifacts.path, "/audit/exports/bundle.tar.sha256"), eq(artifacts.auditId, audit.id))).orderBy(desc(artifacts.updatedAt)).limit(1);
     const ok = bundle.length > 0 && checksumRow.length > 0;
     check("artifact.package produced a bundle + checksum artifact", ok, ok ? `${bundle[0].sizeBytes}B` : "missing rows");
     if (ok) {
       const decoded = Buffer.from(bundle[0].content, "base64");
-      check("bundle content is base64-decodable TAR (ustar magic)", decoded.length > 512 && decoded.slice(257, 263).toString("ascii") === "ustar", `${decoded.length}B decoded`);
+      check("bundle content is base64-decodable TAR (ustar magic)", decoded.length > 512 && decoded.slice(257, 262).toString("ascii") === "ustar", `${decoded.length}B decoded`);
       /* Hash the raw TAR bytes — NOT decoded.toString("latin1") which
          re-encodes as UTF-8 and produces a different digest. The executor
          now uses createHash("sha256").update(tar).digest("hex") on the
