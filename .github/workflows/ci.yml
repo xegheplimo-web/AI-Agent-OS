@@ -80,6 +80,12 @@ jobs:
             || (echo "::error::migrations did not create the audits_active_uidx index" && exit 1)
           echo "All $(find drizzle -maxdepth 1 -name '*.sql' | wc -l) migration files applied successfully."
 
+      # Re-push schema after the migration verify step dropped all tables.
+      # The migration verify intentionally destroys the schema to test the
+      # .sql files from scratch; db:push restores it so seed + tests can run.
+      - name: Re-push schema (after migration verify dropped tables)
+        run: npm run db:push
+
       - name: Seed demo data
         run: npm run db:seed
 
