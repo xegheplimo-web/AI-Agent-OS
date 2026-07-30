@@ -217,7 +217,7 @@ jobs:
       matrix:
         include:
           - platform: ubuntu-latest
-            bundles: appimage,deb
+            bundles: deb
           - platform: windows-latest
             bundles: nsis
           - platform: macos-latest
