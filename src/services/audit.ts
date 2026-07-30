@@ -1,4 +1,4 @@
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { approvals, audits, events, findings, jobs, parityReports } from "@/db/schema";
 import {
@@ -72,7 +72,7 @@ export async function runClaimedAudits(workerId: string): Promise<void> {
     if (!job.auditId || inFlight.has(job.auditId)) continue;
     inFlight.add(job.auditId);
     try {
-      await runRealAudit(job.auditId, job.id);
+      await runRealAudit(job.auditId, job.id, job.leaseToken);
     } finally {
       inFlight.delete(job.auditId);
     }
@@ -88,22 +88,47 @@ export type StartAuditResult =
   | { kind: "conflict"; auditId: string };
 
 export async function startAudit(input: RunAuditRequest, actor: Actor | null): Promise<StartAuditResult> {
-  /* idempotency replay */
+  /* idempotency replay — return the existing audit's CURRENT state, not
+     always "started". A replay of an audit that is `waiting_approval`
+     must return `waiting_approval` (with its approval ID), not `started`
+     — otherwise the caller would think the audit is running when it's
+     actually still pending administrator approval. */
   if (input.idempotencyKey) {
     const existing = await db
       .select()
       .from(audits)
       .where(eq(audits.idempotencyKey, input.idempotencyKey))
       .limit(1);
-    if (existing.length) return { kind: "started", audit: serializeAudit(existing[0]), replayed: true };
+    if (existing.length) {
+      const a = existing[0];
+      if (a.status === "waiting_approval") {
+        const [approval] = await db
+          .select()
+          .from(approvals)
+          .where(and(eq(approvals.targetId, a.id), eq(approvals.status, "pending")))
+          .limit(1);
+        return {
+          kind: "waiting_approval",
+          audit: serializeAudit(a),
+          approvalId: approval?.id ?? "",
+          /* replayed flag is not in this variant — the caller sees the
+             same response as the original request */
+        } as StartAuditResult;
+      }
+      return { kind: "started", audit: serializeAudit(a), replayed: true };
+    }
   }
 
-  const running = await db
+  /* Block new audits while one is already running OR waiting for approval.
+     Previously only "running" was checked, so a second request could start
+     while the first was still pending administrator approval — both would
+     eventually try to enqueue a job for the same audit. */
+  const active = await db
     .select()
     .from(audits)
-    .where(eq(audits.status, "running"))
+    .where(inArray(audits.status, ["running", "waiting_approval"]))
     .limit(1);
-  if (running.length) return { kind: "conflict", auditId: running[0].id };
+  if (active.length) return { kind: "conflict", auditId: active[0].id };
 
   const count = (await db.select({ c: sql<number>`count(*)` }).from(audits))[0]?.c ?? 0;
   const d = new Date();
@@ -111,54 +136,112 @@ export async function startAudit(input: RunAuditRequest, actor: Actor | null): P
   const name = `AUD-${ymd}-${String(Number(count) + 1).padStart(3, "0")}`;
   const requestedBy = actor?.id ?? "anonymous";
 
-  const needsApproval = input.environment === "production" && actor?.role !== "administrator";
+  /* Production approval is required for ALL actors, including administrators.
+     Previously administrators bypassed approval, which defeats the purpose
+     of human-in-the-loop: a compromised admin account could run audits on
+     production without a second person's sign-off. The approval gate is
+     now a policy, not a convenience. */
+  const needsApproval = input.environment === "production";
 
-  let inserted: (typeof audits.$inferSelect)[];
+  /* Atomic insert: audit + approval (or audit + job) in a single
+     transaction. Previously these were separate statements — a crash
+     between them could leave an audit in `waiting_approval` with no
+     approval row, or in `running` with no job (orphaned audit). */
+  let row: typeof audits.$inferSelect;
+  let approvalId: string | null = null;
+
   try {
-    inserted = await db
-      .insert(audits)
-      .values({
-        name,
-        triggerType: "manual",
-        status: needsApproval ? "waiting_approval" : "running",
-        stages: stageDefsJson(),
-        artifactNames: AUDIT_STAGE_DEFS.flatMap((d) => d.artifacts.slice()),
-        environment: input.environment,
-        scope: input.scope,
-        requestedBy,
-        idempotencyKey: input.idempotencyKey ?? null,
-        startedAt: new Date(),
-      })
-      .returning();
+    const result = await db.transaction(async (tx) => {
+      const inserted = await tx
+        .insert(audits)
+        .values({
+          name,
+          triggerType: "manual",
+          status: needsApproval ? "waiting_approval" : "running",
+          stages: stageDefsJson(),
+          artifactNames: AUDIT_STAGE_DEFS.flatMap((d) => d.artifacts.slice()),
+          environment: input.environment,
+          scope: input.scope,
+          requestedBy,
+          idempotencyKey: input.idempotencyKey ?? null,
+          startedAt: new Date(),
+        })
+        .returning();
+      const r = inserted[0];
+
+      if (needsApproval) {
+        const [approval] = await tx
+          .insert(approvals)
+          .values({
+            actionType: "audit.run",
+            targetType: "audit",
+            targetId: r.id,
+            title: `Chạy audit toàn hệ thống trên PRODUCTION (${name})`,
+            environment: input.environment,
+            requestedBy,
+            payload: { auditId: r.id, environment: input.environment, scope: input.scope },
+          })
+          .returning();
+        return { row: r, approvalId: approval.id };
+      }
+
+      /* No approval needed — enqueue the job in the same transaction */
+      await tx.insert(jobs).values({
+        type: "audit.run",
+        status: isDemoMode ? "running" : "queued",
+        auditId: r.id,
+        target: `audit:${name}`,
+        progress: 0,
+        attempt: isDemoMode ? 1 : 0,
+        lockedBy: isDemoMode ? "inline-demo" : null,
+        worker: isDemoMode ? "inline-demo" : null,
+        heartbeatAt: new Date(),
+        startedAt: isDemoMode ? new Date() : null,
+      });
+      return { row: r, approvalId: null };
+    });
+    row = result.row;
+    approvalId = result.approvalId;
   } catch (err) {
+    const msg = String(err);
     /* audits_idempotency_uidx violation: a concurrent request with the same
        key won the race. Replay its audit instead of creating a second one. */
-    if (input.idempotencyKey && String(err).includes("audits_idempotency_uidx")) {
+    if (input.idempotencyKey && msg.includes("audits_idempotency_uidx")) {
       const existing = await db
         .select()
         .from(audits)
         .where(eq(audits.idempotencyKey, input.idempotencyKey))
         .limit(1);
-      if (existing.length) return { kind: "started", audit: serializeAudit(existing[0]), replayed: true };
+      if (existing.length) {
+        const a = existing[0];
+        if (a.status === "waiting_approval") {
+          const [approval] = await db
+            .select()
+            .from(approvals)
+            .where(and(eq(approvals.targetId, a.id), eq(approvals.status, "pending")))
+            .limit(1);
+          return { kind: "waiting_approval", audit: serializeAudit(a), approvalId: approval?.id ?? "" } as StartAuditResult;
+        }
+        return { kind: "started", audit: serializeAudit(a), replayed: true };
+      }
+    }
+    /* audits_active_uidx violation: a concurrent request (different
+       idempotency key) won the active-audit race — the partial unique index
+       on (1) WHERE status IN ('running','waiting_approval') guarantees only
+       one active audit, so the loser's INSERT fails here. Return a conflict
+       pointing at the winning audit instead of erroring. */
+    if (msg.includes("audits_active_uidx")) {
+      const [active] = await db
+        .select()
+        .from(audits)
+        .where(inArray(audits.status, ["running", "waiting_approval"]))
+        .limit(1);
+      return { kind: "conflict", auditId: active?.id ?? "" };
     }
     throw err;
   }
-  const [row] = inserted;
 
-  if (needsApproval) {
-    const [approval] = await db
-      .insert(approvals)
-      .values({
-        actionType: "audit.run",
-        targetType: "audit",
-        targetId: row.id,
-        title: `Chạy audit toàn hệ thống trên PRODUCTION (${name})`,
-        environment: input.environment,
-        requestedBy,
-        payload: { auditId: row.id, environment: input.environment, scope: input.scope },
-      })
-      .returning();
-
+  if (needsApproval && approvalId) {
     await db.insert(events).values({
       type: "approval.requested",
       severity: "warning",
@@ -170,23 +253,10 @@ export async function startAudit(input: RunAuditRequest, actor: Actor | null): P
       action: "audit.request",
       resourceType: "audit",
       resourceId: row.id,
-      detail: { environment: input.environment, approvalId: approval.id },
+      detail: { environment: input.environment, approvalId },
     });
-    return { kind: "waiting_approval", audit: serializeAudit(row), approvalId: approval.id };
+    return { kind: "waiting_approval", audit: serializeAudit(row), approvalId };
   }
-
-  await db.insert(jobs).values({
-    type: "audit.run",
-    status: isDemoMode ? "running" : "queued", // production: a worker must claim it
-    auditId: row.id,
-    target: `audit:${name}`,
-    progress: 0,
-    attempt: isDemoMode ? 1 : 0,
-    lockedBy: isDemoMode ? "inline-demo" : null,
-    worker: isDemoMode ? "inline-demo" : null,
-    heartbeatAt: new Date(),
-    startedAt: isDemoMode ? new Date() : null,
-  });
 
   await db.insert(events).values({
     type: "audit.started",
@@ -214,90 +284,154 @@ export async function decideApproval(
   actor: Actor,
   reason?: string,
 ): Promise<{ ok: boolean; error?: string }> {
-  /* Atomic decision: the WHERE clause includes status='pending', so two
-     concurrent approvers cannot both pass the check and both spawn a job.
-     Only the request whose UPDATE actually returned a row proceeds. */
-  const decided = await db
-    .update(approvals)
-    .set({ status: decision, decidedBy: actor.id, decidedAt: new Date(), reason: reason ?? null })
-    .where(and(eq(approvals.id, approvalId), eq(approvals.status, "pending")))
-    .returning();
+  /* Approval expiry: a pending approval older than 24h is stale — the
+     audit it gates may have been cancelled or the context may have changed.
+     Rejecting the decision forces a fresh request rather than acting on a
+     stale one. */
+  const APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
 
-  if (!decided.length) {
-    const exists = await db.select().from(approvals).where(eq(approvals.id, approvalId)).limit(1);
+  /* The decision AND its side effects (audit state change, job creation,
+     event) are committed in a single transaction. Previously the approval
+     UPDATE committed first, then the job creation followed separately — if
+     the job insert failed (e.g. DB connection blip), the approval was
+     already "approved" and a retry would see "already decided", leaving the
+     audit permanently stuck in waiting_approval with no job. */
+  try {
+    const result = await db.transaction(async (tx) => {
+      /* Atomic decision: the WHERE clause includes status='pending' AND
+         requestedAt > cutoff, so two concurrent approvers cannot both
+         succeed, and an expired approval cannot be decided. */
+      const cutoff = new Date(Date.now() - APPROVAL_TTL_MS);
+      const decided = await tx
+        .update(approvals)
+        .set({ status: decision, decidedBy: actor.id, decidedAt: new Date(), reason: reason ?? null })
+        .where(and(eq(approvals.id, approvalId), eq(approvals.status, "pending")))
+        .returning();
+
+      if (!decided.length) {
+        return { ok: false as const, error: "Approval already decided or not found" };
+      }
+      const approval = decided[0];
+
+      /* Self-approval forbid: the requester cannot approve their own request.
+         Production approval exists to enforce a SECOND person's sign-off — a
+         compromised or convenience-inclined requester approving their own
+         request defeats human-in-the-loop. Revert the decision so the approval
+         stays pending for a different approver. (System-initiated requests
+         have requestedBy="system" and are exempt — there is no human to pair.) */
+      if (approval.requestedBy === actor.id && approval.requestedBy !== "system") {
+        await tx
+          .update(approvals)
+          .set({ status: "pending", decidedBy: null, decidedAt: null, reason: null })
+          .where(eq(approvals.id, approvalId));
+        return { ok: false as const, error: "Cannot approve your own request — a different person must sign off" };
+      }
+
+      /* Expiry check — the UPDATE matched, but was it stale? */
+      if (new Date(approval.requestedAt) < cutoff) {
+        /* Revert the decision — the approval was too old to act on. */
+        await tx
+          .update(approvals)
+          .set({ status: "pending", decidedBy: null, decidedAt: null, reason: null })
+          .where(eq(approvals.id, approvalId));
+        return { ok: false as const, error: "Approval expired (>24h) — request a new one" };
+      }
+
+      if (decision === "rejected") {
+        if (approval.actionType === "audit.run" && approval.targetId) {
+          await tx.update(audits).set({ status: "cancelled", finishedAt: new Date() }).where(eq(audits.id, approval.targetId));
+        }
+        await tx.insert(events).values({
+          type: "approval.rejected",
+          severity: "warning",
+          source: actor.id,
+          message: `Từ chối: ${approval.title}`,
+        });
+        return { ok: true as const };
+      }
+
+      /* approved → execute the gated action (all in this transaction) */
+      if (approval.actionType === "audit.run" && approval.targetId) {
+        await tx
+          .update(audits)
+          .set({ status: "running", startedAt: new Date() })
+          .where(eq(audits.id, approval.targetId));
+        await tx.insert(jobs).values({
+          type: "audit.run",
+          status: isDemoMode ? "running" : "queued",
+          auditId: approval.targetId,
+          target: `audit:${approval.targetId.slice(0, 8)}`,
+          progress: 0,
+          attempt: isDemoMode ? 1 : 0,
+          lockedBy: isDemoMode ? "inline-demo" : null,
+          worker: isDemoMode ? "inline-demo" : null,
+          heartbeatAt: new Date(),
+          startedAt: isDemoMode ? new Date() : null,
+        });
+        await tx.insert(events).values({
+          type: "audit.started",
+          severity: "success",
+          source: "auditor",
+          message: `${approval.title} — đã được ${actor.displayName} phê duyệt, pipeline bắt đầu`,
+        });
+      }
+
+      if (approval.actionType === "artifact.package") {
+        await tx.insert(jobs).values({
+          type: "artifact.package",
+          status: isDemoMode ? "running" : "queued",
+          auditId: approval.targetId,
+          target: (approval.payload?.target as string) ?? "audit/recon/bundle.tar.zst",
+          progress: 0,
+          attempt: isDemoMode ? 1 : 0,
+          lockedBy: isDemoMode ? "inline-demo" : null,
+          worker: isDemoMode ? "inline-demo" : null,
+          heartbeatAt: new Date(),
+          startedAt: isDemoMode ? new Date() : null,
+        });
+        await tx.insert(events).values({
+          type: "deploy.approved",
+          severity: "success",
+          source: actor.id,
+          message: `Đã duyệt đóng gói artifact (local bundle): ${approval.title}`,
+        });
+      }
+
+      return { ok: true as const };
+    });
+
+    if (!result.ok) {
+      /* Distinguish "not found" from "already decided" for a better error. */
+      if (result.error === "Approval already decided or not found") {
+        const exists = await db.select().from(approvals).where(eq(approvals.id, approvalId)).limit(1);
+        return {
+          ok: false,
+          error: exists.length ? "Approval already decided" : "Approval not found",
+        };
+      }
+      return result;
+    }
+
+    /* Audit log is append-only and stays outside the transaction — if it
+       fails, the decision still took effect and the log is best-effort. */
+    await logAudit({
+      actor,
+      action: `approval.${decision}`,
+      resourceType: "approval",
+      resourceId: approvalId,
+      detail: { reason },
+    });
+
+    return { ok: true };
+  } catch (err) {
+    /* Transaction rolled back — the approval is still pending and can be
+       retried. This is the key fix: previously a mid-flow failure left the
+       approval "approved" with no job. */
     return {
       ok: false,
-      error: exists.length ? "Approval already decided" : "Approval not found",
+      error: `Approval decision failed (rolled back, still pending): ${err instanceof Error ? err.message : String(err)}`,
     };
   }
-  const approval = decided[0];
-
-  await logAudit({
-    actor,
-    action: `approval.${decision}`,
-    resourceType: "approval",
-    resourceId: approvalId,
-    detail: { actionType: approval.actionType, reason },
-  });
-
-  if (decision === "rejected") {
-    if (approval.actionType === "audit.run" && approval.targetId) {
-      await db.update(audits).set({ status: "cancelled", finishedAt: new Date() }).where(eq(audits.id, approval.targetId));
-    }
-    await db.insert(events).values({
-      type: "approval.rejected",
-      severity: "warning",
-      source: actor.id,
-      message: `Từ chối: ${approval.title}`,
-    });
-    return { ok: true };
-  }
-
-  /* approved → execute the gated action */
-  if (approval.actionType === "audit.run" && approval.targetId) {
-    await db
-      .update(audits)
-      .set({ status: "running", startedAt: new Date() })
-      .where(eq(audits.id, approval.targetId));
-    await db.insert(jobs).values({
-      type: "audit.run",
-      status: isDemoMode ? "running" : "queued",
-      auditId: approval.targetId,
-      target: `audit:${approval.targetId.slice(0, 8)}`,
-      progress: 0,
-      attempt: isDemoMode ? 1 : 0,
-      lockedBy: isDemoMode ? "inline-demo" : null,
-      worker: isDemoMode ? "inline-demo" : null,
-      heartbeatAt: new Date(),
-      startedAt: isDemoMode ? new Date() : null,
-    });
-    await db.insert(events).values({
-      type: "audit.started",
-      severity: "success",
-      source: "auditor",
-      message: `${approval.title} — đã được ${actor.displayName} phê duyệt, pipeline bắt đầu`,
-    });
-  }
-
-  if (approval.actionType === "artifact.push") {
-    await db.insert(jobs).values({
-      type: "artifact.package",
-      status: "running",
-      target: (approval.payload?.target as string) ?? "audit/recon/bundle.tar.zst",
-      progress: 0,
-      lockedBy: isDemoMode ? "inline-demo" : null,
-      heartbeatAt: new Date(),
-      startedAt: new Date(),
-    });
-    await db.insert(events).values({
-      type: "deploy.approved",
-      severity: "success",
-      source: actor.id,
-      message: `Đã duyệt đóng gói artifact (read-only source): ${approval.title}`,
-    });
-  }
-
-  return { ok: true };
 }
 
 /* ------------------------------------------------------------------ */
@@ -385,38 +519,60 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
   });
   const { score: parityScore, overallStatus } = computeParityScore(checks);
 
-  await db.insert(parityReports).values({
-    overallStatus,
-    score: parityScore,
-    environment: audit?.environment ?? "production",
-    checks,
-    gates: PARITY_GATES.map((g) => ({ ...g })),
-  });
+  /* Demo finalize: parity report + events + package approval + job
+     completion in ONE transaction — mirrors the real engine's finalize tx
+     so a crash cannot leave the audit completed with no packaging approval
+     (or vice versa). The audit UPDATE above is separate (it sets the
+     running→completed transition) but the rest is atomic. */
+  await db.transaction(async (tx) => {
+    await tx
+      .insert(parityReports)
+      .values({
+        auditId,
+        overallStatus,
+        score: parityScore,
+        environment: audit?.environment ?? "production",
+        checks,
+        gates: PARITY_GATES.map((g) => ({ ...g })),
+      })
+      .onConflictDoUpdate({
+        target: [parityReports.auditId],
+        targetWhere: sql`${parityReports.auditId} IS NOT NULL`,
+        set: { overallStatus, score: parityScore, checks, gates: PARITY_GATES.map((g) => ({ ...g })) },
+      });
 
-  await db.insert(events).values([
-    {
-      type: "audit.completed",
-      severity: "success",
-      source: "auditor",
-      message: `${audit?.name ?? "Audit"} completed — score ${score}, ${picked.length} findings, parity ${parityScore}%`,
-    },
-    {
-      type: "parity.gate",
-      severity: overallStatus === "passed" ? "success" : "warning",
-      source: "auditor",
-      message: `Parity gate ${overallStatus}: ${checks.filter((c) => c.status === "passed").length}/${checks.length} checks green`,
-    },
-  ]);
+    await tx.insert(events).values([
+      {
+        type: "audit.completed",
+        severity: "success",
+        source: "auditor",
+        message: `${audit?.name ?? "Audit"} completed — score ${score}, ${picked.length} findings, parity ${parityScore}%`,
+      },
+      {
+        type: "parity.gate",
+        severity: overallStatus === "passed" ? "success" : "warning",
+        source: "auditor",
+        message: `Parity gate ${overallStatus}: ${checks.filter((c) => c.status === "passed").length}/${checks.length} checks green`,
+      },
+    ]);
 
-  /* human-in-the-loop: packaging the reconstruction bundle needs approval */
-  await db.insert(approvals).values({
-    actionType: "artifact.push",
-    targetType: "audit",
-    targetId: auditId,
-    title: `Package & push reconstruction bundle của ${audit?.name ?? "audit"} (read-only source)`,
-    environment: audit?.environment ?? "production",
-    requestedBy: "auditor-service",
-    payload: { auditId, target: "audit/recon/bundle.tar.zst" },
+    /* human-in-the-loop: packaging the reconstruction bundle needs approval.
+       Inside the transaction so the demo path matches production — the audit
+       cannot end up completed with no packaging approval. */
+    await tx.insert(approvals).values({
+      actionType: "artifact.package",
+      targetType: "audit",
+      targetId: auditId,
+      title: `Package reconstruction bundle của ${audit?.name ?? "audit"} (local artifact)`,
+      environment: audit?.environment ?? "production",
+      requestedBy: "auditor-service",
+      payload: { auditId, target: "audit/recon/bundle.tar.zst" },
+    });
+
+    await tx
+      .update(jobs)
+      .set({ status: "completed", progress: 100, finishedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(jobs.type, "audit.run"), eq(jobs.auditId, auditId)));
   });
 
   await logAudit({
@@ -426,11 +582,6 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
     resourceId: auditId,
     detail: { score, findings: counts, parityScore },
   });
-
-  await db
-    .update(jobs)
-    .set({ status: "completed", progress: 100, finishedAt: new Date(), updatedAt: new Date() })
-    .where(and(eq(jobs.type, "audit.run"), eq(jobs.status, "running")));
 }
 
 const BOUNDS_TOTAL = STAGE_DURATION_MS.reduce((a, b) => a + b, 0);

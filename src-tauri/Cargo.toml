@@ -1,6 +1,6 @@
 [package]
 name = "ai-agent-os"
-version = "0.1.0"
+version = "0.5.0"
 description = "AI Agent OS — desktop shell for the control plane"
 edition = "2021"
 

@@ -2,6 +2,7 @@ import { desc, gt } from "drizzle-orm";
 import { db } from "@/db";
 import { events } from "@/db/schema";
 import { eventDtoSchema } from "@/lib/contracts";
+import { requirePermission } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -12,6 +13,13 @@ export const runtime = "nodejs";
 /* ------------------------------------------------------------------ */
 
 export async function GET(req: Request) {
+  /* SSE uses cookies same-origin (EventSource cannot set custom headers),
+     so the session cookie is sent automatically. Validate it here — a
+     fake cookie passes the Edge middleware presence check but getActor
+     will reject it. */
+  const auth = await requirePermission(req, "system:read");
+  if (auth instanceof Response) return auth;
+
   const encoder = new TextEncoder();
   let lastId = 0;
   let closed = false;

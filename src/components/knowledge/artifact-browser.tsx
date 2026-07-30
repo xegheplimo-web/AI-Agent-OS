@@ -36,7 +36,10 @@ export function ArtifactBrowser() {
   const [kind, setKind] = useState<string>("all");
   const selectedArtifactId = useUIStore((s) => s.selectedArtifactId);
   const setSelectedArtifact = useUIStore((s) => s.setSelectedArtifact);
-  const setSelectedId = (id: number | null) => setSelectedArtifact(id);
+  const setSelectedId = (id: number | null) => {
+    setChecksum("idle");
+    setSelectedArtifact(id);
+  };
   const selectedId = selectedArtifactId;
   const [copied, setCopied] = useState(false);
   const [checksum, setChecksum] = useState<"idle" | "checking" | "match" | "mismatch">("idle");
@@ -47,8 +50,6 @@ export function ArtifactBrowser() {
     queryFn: () => api.artifact(selectedId!),
     enabled: selectedId != null,
   });
-
-  useEffect(() => setChecksum("idle"), [selectedId]);
 
   async function verifyChecksum() {
     if (!detail.data?.content || !detail.data.sha256) return;

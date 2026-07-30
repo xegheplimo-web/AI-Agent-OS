@@ -13,13 +13,14 @@ import { Chip, NeonButton, Panel, StatusDot } from "@/components/ui";
 const STAGE_TONES = ["#37d6ff", "#8b5cf6", "#20e3a2"];
 
 function Elapsed({ startedAt }: { startedAt: string }) {
-  const [, tick] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
-    const t = setInterval(() => tick((v) => v + 1), 200);
+    const update = () => setElapsed(Date.now() - new Date(startedAt).getTime());
+    update();
+    const t = setInterval(update, 200);
     return () => clearInterval(t);
-  }, []);
-  const ms = Date.now() - new Date(startedAt).getTime();
-  return <span className="font-mono text-[12px] text-cyan tabular-nums">{(ms / 1000).toFixed(1)}s</span>;
+  }, [startedAt]);
+  return <span className="font-mono text-[12px] text-cyan tabular-nums">{(elapsed / 1000).toFixed(1)}s</span>;
 }
 
 export function AuditConsole() {

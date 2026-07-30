@@ -1,16 +1,22 @@
-import { and, desc, eq } from "drizzle-orm";
-import { db } from "@/db";
+import { and, desc, eq, or } from "drizzle-orm";
+import { db, pool } from "@/db";
 import { audits, events, jobs } from "@/db/schema";
 import type { Actor } from "@/lib/auth";
 import { logAudit } from "@/lib/audit-log";
 import { jobDtoSchema, type JobDTO } from "@/lib/contracts";
 import { isDemoMode } from "@/services/mode";
+import { hasExecutor, runExecutor } from "@/services/executors";
+import { createLeaseFence, LeaseLostError } from "@/services/lease";
 
 /* ------------------------------------------------------------------ */
 /* Job service — DB-backed queue. Demo mode advances jobs inline; in   */
 /* production the external worker (src/worker/index.ts) claims them.   */
 /* ------------------------------------------------------------------ */
 
+/* Demo-mode pacing only. In production the executor runs synchronously and
+ * the job completes when the executor returns (or fails). The durations are
+ * kept so a demo deployment still shows the staged-progress timeline without
+ * running the real (potentially slow) scanners on every API request. */
 const JOB_DURATION_MS: Record<string, number> = {
   "sbom.export": 6000,
   "parity.gate": 9000,
@@ -47,7 +53,7 @@ export async function enqueueJob(
       status: isDemoMode ? "running" : "queued",
       target,
       progress: 0,
-      attempt: 1,
+      attempt: 0,
       worker: isDemoMode ? "inline-demo" : null,
       lockedBy: isDemoMode ? "inline-demo" : null,
       heartbeatAt: new Date(),
@@ -66,12 +72,122 @@ export async function enqueueJob(
   return serializeJob(row);
 }
 
-/* One engine tick — shared by demo inline runner and the worker process. */
-export async function advanceJobsOnce(): Promise<void> {
-  const active = await db.select().from(jobs).where(eq(jobs.status, "running"));
+/**
+ * One engine tick — shared by demo inline runner and the worker process.
+ *
+ * `workerId` scopes the query to jobs this worker owns (locked_by match).
+ * Without it, every worker's tick would advance every running job, making
+ * the locked_by ownership field decorative for non-audit.run job types.
+ * Demo mode calls without a workerId because all jobs are owned by
+ * "inline-demo" and there is only one inline runner.
+ */
+export async function advanceJobsOnce(workerId?: string): Promise<void> {
+  const ownerFilter = workerId
+    ? and(eq(jobs.status, "running"), or(eq(jobs.lockedBy, workerId), eq(jobs.lockedBy, "inline-demo")))
+    : eq(jobs.status, "running");
+  const active = await db.select().from(jobs).where(ownerFilter);
   const now = Date.now();
   for (const job of active) {
     if (job.type === "audit.run") continue; // audit pipeline owns its own completion
+
+    /* Production: run the real executor. The job was claimed by a worker, so
+     * this is the worker's tick — it runs the executor synchronously and
+     * marks the job completed/failed based on the outcome. There is no
+     * wall-clock simulation in production: a job that has no executor is a
+     * configuration error, not a "slow" job. */
+    if (!isDemoMode && hasExecutor(job.type)) {
+      /* Background heartbeat + lease fence: a long executor (e.g.
+         artifact.package on a large audit) could exceed the 45s stale-
+         recovery threshold. The fence heartbeats every 15s AND gives the
+         executor an `assert()` it must call before each side effect, so a
+         stale worker aborts the moment it loses ownership instead of
+         continuing to write artifacts/reports that clobber the new owner's
+         run. */
+      const fence = createLeaseFence(job.id, job.leaseToken);
+
+      try {
+        if (fence.leaseLost()) throw new LeaseLostError();
+        await runExecutor(job, fence);
+        /* Lease fencing: only mark completed if we still own the job. If the
+           stale supervisor requeued it (clearing lease_token) and another
+           worker claimed it, this update is a no-op — we lost ownership
+           during the executor run. */
+        const leaseFilter = job.leaseToken
+          ? and(eq(jobs.id, job.id), eq(jobs.leaseToken, job.leaseToken))
+          : eq(jobs.id, job.id);
+        const finalized = await db
+          .update(jobs)
+          .set({ status: "completed", progress: 100, finishedAt: new Date(), heartbeatAt: new Date(), updatedAt: new Date() })
+          .where(leaseFilter)
+          .returning({ id: jobs.id });
+        if (job.leaseToken && !finalized.length) {
+          await db.insert(events).values({
+            type: "job.requeued",
+            severity: "warning",
+            source: job.worker ?? job.lockedBy ?? "worker",
+            message: `${job.type} for ${job.target}: lease lost during executor — another worker owns this job now`,
+          });
+        } else {
+          await db.insert(events).values({
+            type: "job.completed",
+            severity: "success",
+            source: job.worker ?? job.lockedBy ?? "worker",
+            message: `${job.type} finished for ${job.target} (real executor)`,
+          });
+        }
+      } catch (err) {
+        /* LEASE_LOST: the worker lost ownership (stale supervisor requeued the
+           job, another worker claimed it). The new owner will handle it. This
+           worker must NOT mark the job failed/retried — that would race the
+           new owner's completion. It DOES emit a `job.requeued` warning event
+           so operators can see the lease change in the event feed (this is
+           observability, not a state mutation). */
+        if (err instanceof LeaseLostError) {
+          await db.insert(events).values({
+            type: "job.requeued",
+            severity: "warning",
+            source: job.worker ?? job.lockedBy ?? "worker",
+            message: `${job.type} for ${job.target}: lease lost during executor — aborting, another worker owns this job now`,
+          });
+        } else {
+          const message = err instanceof Error ? err.message : String(err);
+          const leaseFilter = job.leaseToken
+            ? and(eq(jobs.id, job.id), eq(jobs.leaseToken, job.leaseToken))
+            : eq(jobs.id, job.id);
+          /* Retry while attempts remain — previously this always set status=
+             'failed', ignoring maxAttempts. A transient executor error (e.g.
+             DB blip during SBOM export) would permanently fail the job instead
+             of giving it the configured retry budget. */
+          const exhausted = job.attempt >= job.maxAttempts;
+          await db
+            .update(jobs)
+            .set({
+              status: exhausted ? "failed" : "queued",
+              lockedBy: null,
+              leaseToken: null,
+              worker: exhausted ? job.worker : null,
+              finishedAt: exhausted ? new Date() : null,
+              heartbeatAt: new Date(),
+              updatedAt: new Date(),
+              errorMessage: message,
+            })
+            .where(leaseFilter);
+          await db.insert(events).values({
+            type: exhausted ? "job.failed" : "job.requeued",
+            severity: "error",
+            source: job.worker ?? job.lockedBy ?? "worker",
+            message: `${job.type} ${exhausted ? "failed" : "requeued for retry"} for ${job.target}: ${message}`,
+          });
+        }
+      } finally {
+        fence.stop();
+      }
+      continue;
+    }
+
+    /* Demo mode (or a job type with no executor yet): staged wall-clock
+     * progress so the dashboard shows a timeline without running the real
+     * (slow) scanners on every API request. */
     const duration = JOB_DURATION_MS[job.type] ?? 8000;
     const startMs = new Date(job.startedAt ?? job.createdAt).getTime();
     const elapsed = now - startMs;
@@ -85,7 +201,7 @@ export async function advanceJobsOnce(): Promise<void> {
         type: "job.completed",
         severity: "success",
         source: job.worker ?? job.lockedBy ?? "worker",
-        message: `${job.type} finished for ${job.target}`,
+        message: `${job.type} finished for ${job.target}${isDemoMode ? " (demo timeline)" : " (no executor — timer only)"}`,
       });
     } else if (progress !== job.progress) {
       await db
@@ -103,64 +219,83 @@ export async function advanceJobsOnce(): Promise<void> {
  * stale heartbeat genuinely means the worker crashed mid-audit. Previously
  * they were skipped and could sit in `running` forever. Recovering the job
  * also resets its audit so another worker can pick the work back up.
+ *
+ * Atomic: the stale check AND the state transition happen in a single
+ * `UPDATE ... WHERE heartbeat_at < ... RETURNING` statement per outcome. The
+ * previous implementation SELECTed rows, evaluated staleness in JS, then
+ * UPDATEd by id — a worker could heartbeat between the SELECT and the UPDATE,
+ * yet the supervisor would still requeue based on the stale snapshot. With
+ * RETURNING, a row is only recovered if the conditional UPDATE actually
+ * matched it; no row returned means no recovery happened.
  */
-const STALE_MS = 45_000;
+const STALE_INTERVAL_MS = 45_000;
 
 export async function requeueStaleJobs(): Promise<number> {
-  const active = await db.select().from(jobs).where(eq(jobs.status, "running"));
-  const now = Date.now();
-  let requeued = 0;
+  /* --- exhausted attempts → terminal `timed_out` --- */
+  const timedOut = await pool.query(
+    `UPDATE jobs
+        SET status='timed_out',
+            finished_at=now(),
+            error_code='HEARTBEAT_LOST',
+            error_message='Worker heartbeat lost after '
+              || round(extract(epoch from (now() - coalesce(heartbeat_at, created_at)))::numeric)
+              || 's',
+            lease_token=NULL,
+            updated_at=now()
+      WHERE status='running'
+        AND locked_by IS DISTINCT FROM 'inline-demo'
+        AND coalesce(heartbeat_at, created_at) < now() - ($1 || ' seconds')::interval
+        AND attempt >= max_attempts
+      RETURNING id, type, target, audit_id`,
+    [String(STALE_INTERVAL_MS / 1000)],
+  );
 
-  for (const job of active) {
-    if (job.lockedBy === "inline-demo") continue; // demo runner owns these
-    const hb = job.heartbeatAt ? new Date(job.heartbeatAt).getTime() : new Date(job.createdAt).getTime();
-    if (now - hb <= STALE_MS) continue;
+  /* --- attempts remain → back to `queued` for another worker --- */
+  const requeued = await pool.query(
+    `UPDATE jobs
+        SET status='queued', locked_by=NULL, worker=NULL, lease_token=NULL, progress=0, updated_at=now()
+      WHERE status='running'
+        AND locked_by IS DISTINCT FROM 'inline-demo'
+        AND coalesce(heartbeat_at, created_at) < now() - ($1 || ' seconds')::interval
+        AND attempt < max_attempts
+      RETURNING id, type, target, audit_id`,
+    [String(STALE_INTERVAL_MS / 1000)],
+  );
 
-    const exhausted = job.attempt >= job.maxAttempts;
-
-    if (exhausted) {
+  let recovered = 0;
+  for (const row of timedOut.rows as Array<{ type: string; target: string; audit_id: string | null }>) {
+    if (row.type === "audit.run" && row.audit_id) {
       await db
-        .update(jobs)
-        .set({
-          status: "timed_out",
-          finishedAt: new Date(),
-          errorCode: "HEARTBEAT_LOST",
-          errorMessage: `Worker heartbeat lost after ${Math.round((now - hb) / 1000)}s`,
-          updatedAt: new Date(),
-        })
-        .where(eq(jobs.id, job.id));
-
-      if (job.type === "audit.run" && job.auditId) {
-        await db
-          .update(audits)
-          .set({ status: "failed", finishedAt: new Date() })
-          .where(and(eq(audits.id, job.auditId), eq(audits.status, "running")));
-      }
-    } else {
-      await db
-        .update(jobs)
-        .set({ status: "queued", lockedBy: null, worker: null, progress: 0, updatedAt: new Date() })
-        .where(eq(jobs.id, job.id));
-
-      /* keep the audit runnable so the next claimer resumes it (upserts make
-         the partial work from the dead worker safe to rewrite) */
-      if (job.type === "audit.run" && job.auditId) {
-        await db
-          .update(audits)
-          .set({ status: "running", finishedAt: null })
-          .where(eq(audits.id, job.auditId));
-      }
+        .update(audits)
+        .set({ status: "failed", finishedAt: new Date() })
+        .where(and(eq(audits.id, row.audit_id), eq(audits.status, "running")));
     }
-
     await db.insert(events).values({
       type: "job.requeued",
       severity: "warning",
       source: "worker-supervisor",
-      message: `${job.type} (${job.target}) ${exhausted ? "timed out" : "requeued"} — heartbeat lost`,
+      message: `${row.type} (${row.target}) timed out — heartbeat lost`,
     });
-    requeued += 1;
+    recovered += 1;
   }
-  return requeued;
+  for (const row of requeued.rows as Array<{ type: string; target: string; audit_id: string | null }>) {
+    /* keep the audit runnable so the next claimer resumes it (upserts make
+       the partial work from the dead worker safe to rewrite) */
+    if (row.type === "audit.run" && row.audit_id) {
+      await db
+        .update(audits)
+        .set({ status: "running", finishedAt: null })
+        .where(eq(audits.id, row.audit_id));
+    }
+    await db.insert(events).values({
+      type: "job.requeued",
+      severity: "warning",
+      source: "worker-supervisor",
+      message: `${row.type} (${row.target}) requeued — heartbeat lost`,
+    });
+    recovered += 1;
+  }
+  return recovered;
 }
 
 export async function advanceJobsIfDemo(): Promise<void> {

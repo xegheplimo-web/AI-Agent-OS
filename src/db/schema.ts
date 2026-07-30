@@ -10,6 +10,8 @@ import {
   index,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { GENERATOR_VERSION } from "@/lib/version";
 
 /* Indexes below were added in response to a real auditor finding:
    "19 cột hot path chưa có index" (database-inventory scanner, pg_indexes).
@@ -68,13 +70,37 @@ export const audits = pgTable("audits", {
   idempotencyKey: text("idempotency_key"),
   startedAt: timestamp("started_at", { withTimezone: true }).defaultNow().notNull(),
   finishedAt: timestamp("finished_at", { withTimezone: true }),
+  /* Generated column: 'active' when status is running/waiting_approval,
+     NULL otherwise. Backs the audits_active_uidx partial unique index so
+     only one audit may be active at a time. Stored (not virtual) so the
+     index can use it without recomputing the expression. Nullable because
+     non-active audits (completed/failed/cancelled) yield NULL — the partial
+     unique index only covers rows WHERE active_bucket IS NOT NULL. */
+  activeBucket: text("active_bucket").generatedAlwaysAs(
+    sql`CASE WHEN "status" IN ('running', 'waiting_approval') THEN 'active' ELSE NULL END`,
+  ),
 }, (t) => [
   index("audits_status_idx").on(t.status),
   index("audits_started_at_idx").on(t.startedAt),
   index("audits_environment_idx").on(t.environment),
-  /* UNIQUE: two concurrent requests carrying the same key must not both
-     insert. The second one hits a constraint violation and replays. */
-  uniqueIndex("audits_idempotency_uidx").on(t.idempotencyKey),
+  /* UNIQUE partial index: only enforces uniqueness when idempotency_key IS
+     NOT NULL. Postgres treats NULLs as distinct in a plain unique index, so
+     without the WHERE clause, multiple NULL-keyed audits would coexist — but
+     the real risk is the opposite: a plain unique index on a nullable column
+     can silently allow duplicates in some edge cases with concurrent inserts.
+     The partial index makes the intent explicit and the constraint airtight. */
+  uniqueIndex("audits_idempotency_uidx").on(t.idempotencyKey).where(sql`${t.idempotencyKey} IS NOT NULL`),
+  /* UNIQUE partial index: at most ONE audit may be in an active state
+     (running OR waiting_approval) at any time. Uses the `status` column
+     directly as the index key with a partial WHERE clause. Since both
+     'running' and 'waiting_approval' are distinct values, a plain unique
+     index on `status` would allow one 'running' AND one 'waiting_approval'
+     to coexist. To collapse both into a single bucket, we add a generated
+     column `active_bucket` that is 'active' for both active states and
+     NULL otherwise, then unique-index it WHERE NOT NULL. A second
+     concurrent insert of any active audit fails with a unique violation,
+     closing the SELECT-then-INSERT race in startAudit. */
+  uniqueIndex("audits_active_uidx").on(t.activeBucket).where(sql`${t.activeBucket} IS NOT NULL`),
 ]);
 
 /* ------------------------------------------------------------------ */
@@ -109,6 +135,12 @@ export const findings = pgTable("findings", {
 /* ------------------------------------------------------------------ */
 export const parityReports = pgTable("parity_reports", {
   id: uuid("id").primaryKey().defaultRandom(),
+  /** The audit this report was produced by. Previously NULL for every row, so
+   *  a retried audit inserted a second report and the "latest parity" query
+   *  could return either one. Now required for auditor-generated reports and
+   *  protected by a partial unique index so a re-run upserts instead of
+   *  duplicating. */
+  auditId: uuid("audit_id").references(() => audits.id, { onDelete: "cascade" }),
   overallStatus: text("overall_status").notNull().default("passed"), // passed | warning | failed
   score: integer("score").notNull().default(100),
   environment: text("environment").notNull().default("production"),
@@ -129,7 +161,14 @@ export const parityReports = pgTable("parity_reports", {
     .$type<Array<{ key: string; label: string; status: string }>>()
     .default([]),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-}, (t) => [index("parity_created_at_idx").on(t.createdAt)]);
+}, (t) => [
+  index("parity_created_at_idx").on(t.createdAt),
+  index("parity_audit_id_idx").on(t.auditId),
+  /* At most one parity report per audit: a retried run upserts instead of
+     creating a second row that drifts the "latest parity" result. Only
+     enforced when audit_id IS NOT NULL (global/manual reports stay allowed). */
+  uniqueIndex("parity_audit_uidx").on(t.auditId).where(sql`${t.auditId} IS NOT NULL`),
+]);
 
 /* ------------------------------------------------------------------ */
 /* Telemetry time series                                               */
@@ -167,7 +206,7 @@ export const jobs = pgTable("jobs", {
   id: uuid("id").primaryKey().defaultRandom(),
   type: text("type").notNull(), // audit.run | sbom.export | parity.gate | artifact.package | knowledge.reindex
   status: text("status").notNull().default("queued"),
-  // queued | preparing | running | waiting_approval | completed | failed | cancelled | timed_out
+  // queued | running | completed | failed | cancelled | timed_out
   /** audit.run jobs carry the audit they own, so a worker only ever runs the
    *  audit belonging to the job it successfully claimed. */
   auditId: uuid("audit_id").references(() => audits.id, { onDelete: "cascade" }),
@@ -177,6 +216,13 @@ export const jobs = pgTable("jobs", {
   maxAttempts: integer("max_attempts").notNull().default(3),
   worker: text("worker"),
   lockedBy: text("locked_by"),
+  /** Fencing token set on claim. Every state transition (heartbeat, finalize,
+   *  progress) must include `WHERE lease_token = $token` — if a stale
+   *  supervisor requeued the job (clearing lease_token), the update matches 0
+   *  rows and the worker knows it lost ownership. Without this, a worker that
+   *  crashed and was requeued could still finalize a job another worker has
+   *  already claimed and is executing. */
+  leaseToken: uuid("lease_token"),
   heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }),
   startedAt: timestamp("started_at", { withTimezone: true }),
   finishedAt: timestamp("finished_at", { withTimezone: true }),
@@ -190,6 +236,13 @@ export const jobs = pgTable("jobs", {
   index("jobs_created_at_idx").on(t.createdAt),
   index("jobs_heartbeat_idx").on(t.heartbeatAt),
   index("jobs_audit_id_idx").on(t.auditId),
+  /* UNIQUE partial index: at most one audit.run job per audit. Prevents a
+     race between startAudit and decideApproval from spawning two jobs for
+     the same audit. Only applies to active (non-terminal) jobs so completed/
+     failed/timed_out rows don't block legitimate re-runs. */
+  uniqueIndex("jobs_audit_run_active_uidx")
+    .on(t.auditId)
+    .where(sql`${t.type} = 'audit.run' AND ${t.status} IN ('queued', 'running')`),
 ]);
 
 /* ------------------------------------------------------------------ */
@@ -211,7 +264,7 @@ export const artifacts = pgTable("artifacts", {
   sha256: text("sha256").notNull().default(""),
   schemaVersion: text("schema_version").notNull().default("1.0"),
   generator: text("generator").notNull().default("ai-system-auditor"),
-  generatorVersion: text("generator_version").notNull().default("0.3.1"),
+  generatorVersion: text("generator_version").notNull().default(GENERATOR_VERSION),
   environment: text("environment").notNull().default("production"),
   content: text("content").notNull().default(""),
   tags: jsonb("tags").$type<string[]>().default([]),
@@ -223,6 +276,11 @@ export const artifacts = pgTable("artifacts", {
   index("artifacts_kind_idx").on(t.kind),
   /* Resume-safe: re-running a stage overwrites the artifact in place. */
   uniqueIndex("artifacts_audit_path_uidx").on(t.auditId, t.path),
+  /* Global artifacts (audit_id IS NULL) — Postgres treats NULLs as distinct
+     in a plain unique index, so without this a retry of a global export (e.g.
+     /audit/exports/sbom.cyclonedx.json) would insert a duplicate row. The
+     partial index closes that gap for the NULL-audit case. */
+  uniqueIndex("artifacts_global_path_uidx").on(t.path).where(sql`${t.auditId} IS NULL`),
 ]);
 
 /* ------------------------------------------------------------------ */
@@ -264,7 +322,7 @@ export const sessions = pgTable("sessions", {
 /* ------------------------------------------------------------------ */
 export const approvals = pgTable("approvals", {
   id: uuid("id").primaryKey().defaultRandom(),
-  actionType: text("action_type").notNull(), // audit.run | artifact.push | artifact.package | config.change
+  actionType: text("action_type").notNull(), // audit.run | artifact.package | config.change
   targetType: text("target_type").notNull().default("system"),
   targetId: text("target_id").notNull().default(""),
   title: text("title").notNull(),

@@ -49,26 +49,50 @@ export interface SystemHealthDTO {
   latencyP95: number;
 }
 
+/* Provenance of the telemetry payload. The UI must never display fabricated
+ * numbers without disclosing their source, and must never claim a live OTLP
+ * feed when none exists.
+ *
+ *   "otlp"        — a real collector ingested the points backing `current`.
+ *                   Only set when the system actually received OTLP records.
+ *   "synthetic"   — demo-mode random-walk sampler produced the points. The
+ *                   numbers are real rows in telemetry_points, but their
+ *                   origin is a Math.sin/random-walk generator, not the app.
+ *   "unavailable" — no collector and no sampler ran. `current` is null and
+ *                   the charts have no data. This is the honest state for a
+ *                   production deployment with no OTLP wiring. */
+export type TelemetrySource = "otlp" | "synthetic" | "unavailable";
+
 export interface TelemetrySummaryDTO {
+  source: TelemetrySource;
+  /* null when source === "unavailable" — there is genuinely no current
+   * reading, and a 0/fallback would be a false signal. */
   current: {
     latencyP95: number;
     latencyP50: number;
     throughput: number;
     errorRate: number;
     queueDepth: number;
-  };
+  } | null;
   series: {
     latencyP95: Array<{ ts: string; value: number }>;
     latencyP50: Array<{ ts: string; value: number }>;
     throughput: Array<{ ts: string; value: number }>;
     errorRate: Array<{ ts: string; value: number }>;
   };
+  /* null when source === "unavailable" — the radar panel is decorative and
+   * must not render fabricated traces/metrics/logs counts.
+   *
+   * `radar.source` is always "synthetic" — it is separate from the main
+   * telemetry `source` so the UI never labels fabricated radar numbers as
+   * "otlp live" when the real telemetry source happens to be otlp. */
   radar: {
+    source: "synthetic";
     traces: { active: number; sampledPct: number };
     metrics: { series: number; scrapeOk: number };
     logs: { linesPerMin: number; errorLines: number };
     baggage: { keys: number; propagationPct: number };
-  };
+  } | null;
 }
 
 export interface ArtifactDTO {

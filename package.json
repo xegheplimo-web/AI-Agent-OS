@@ -1,6 +1,11 @@
 {
-  "name": "nextjs-postgresql-template",
+  "name": "ai-agent-os",
+  "version": "0.5.0",
   "private": true,
+  "engines": {
+    "node": ">=22 <23",
+    "npm": ">=10.9.8 <11"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -17,7 +22,10 @@
     "worker": "tsx src/worker/index.ts",
     "verify": "npm run lint && npm run typecheck && npm run test && npm run build",
     "audit:verify": "tsx scripts/verify-real-engine.ts",
-    "verify:worker": "tsx scripts/verify-worker.ts"
+    "verify:worker": "tsx scripts/verify-worker.ts",
+    "verify:release": "tsx scripts/verify-release.ts",
+    "verify:executors": "tsx scripts/verify-executors.ts",
+    "icons": "node scripts/generate-icons.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.4",
@@ -27,7 +35,7 @@
     "drizzle-orm": "0.45.2",
     "framer-motion": "^12.43.0",
     "lucide-react": "^1.27.0",
-    "next": "16.2.6",
+    "next": "16.2.11",
     "pg": "8.20.0",
     "react": "19.2.6",
     "react-dom": "19.2.6",
@@ -47,7 +55,7 @@
     "drizzle-kit": "0.31.10",
     "eslint": "9.39.4",
     "eslint-config-next": "16.2.6",
-    "postcss": "8.5.8",
+    "postcss": "8.5.18",
     "tailwindcss": "4.1.17",
     "typescript": "5.9.3"
   }

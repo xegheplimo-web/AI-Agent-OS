@@ -2,10 +2,14 @@ import { desc } from "drizzle-orm";
 import { db } from "@/db";
 import { approvals } from "@/db/schema";
 import { approvalDtoSchema, type ApprovalDTO } from "@/lib/contracts";
+import { requirePermission } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
+  const auth = await requirePermission(req, "system:read");
+  if (auth instanceof Response) return auth;
+
   const url = new URL(req.url);
   const status = url.searchParams.get("status");
 

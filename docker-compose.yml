@@ -83,8 +83,8 @@ services:
       APP_MODE: demo
       NEXT_PUBLIC_APP_MODE: demo
       DATABASE_URL: postgresql://agent_os:agent_os@postgres:5432/agent_os
-      API_INTERNAL_TOKEN: change-me-internal-token-min-16
-      SESSION_SECRET: change-me-session-secret-min-16
+      API_INTERNAL_TOKEN: ${API_INTERNAL_TOKEN:?must be set — generate with: openssl rand -hex 32}
+      SESSION_SECRET: ${SESSION_SECRET:?must be set — generate with: openssl rand -hex 32}
     ports:
       - "3000:3000"
     depends_on:
@@ -107,9 +107,9 @@ services:
       APP_MODE: production
       NEXT_PUBLIC_APP_MODE: production
       DATABASE_URL: postgresql://agent_os:agent_os@postgres:5432/agent_os
-      AUDITOR_SERVICE_TOKEN: change-me-auditor-token-min-16
-      WORKER_SERVICE_TOKEN: change-me-worker-token-min-16
-      SESSION_SECRET: change-me-session-secret-min-16
+      AUDITOR_SERVICE_TOKEN: ${AUDITOR_SERVICE_TOKEN:?must be set — generate with: openssl rand -hex 32}
+      WORKER_SERVICE_TOKEN: ${WORKER_SERVICE_TOKEN:?must be set — generate with: openssl rand -hex 32}
+      SESSION_SECRET: ${SESSION_SECRET:?must be set — generate with: openssl rand -hex 32}
     ports:
       - "3000:3000"
     depends_on:
@@ -133,7 +133,7 @@ services:
       NODE_ENV: production
       APP_MODE: production
       DATABASE_URL: postgresql://agent_os:agent_os@postgres:5432/agent_os
-      WORKER_SERVICE_TOKEN: change-me-worker-token-min-16
+      WORKER_SERVICE_TOKEN: ${WORKER_SERVICE_TOKEN:?must be set — generate with: openssl rand -hex 32}
     depends_on:
       migrate:
         condition: service_completed_successfully

@@ -3,10 +3,14 @@ import { db } from "@/db";
 import { events } from "@/db/schema";
 import { ensureEventFreshIfDemo } from "@/services/audit";
 import { eventDtoSchema, type EventDTO } from "@/lib/contracts";
+import { requirePermission } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
+  const auth = await requirePermission(req, "system:read");
+  if (auth instanceof Response) return auth;
+
   await ensureEventFreshIfDemo();
   const url = new URL(req.url);
   const limit = Math.min(60, Number(url.searchParams.get("limit") ?? 24));

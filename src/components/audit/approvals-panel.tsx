@@ -10,7 +10,6 @@ import { Chip, GhostButton, Panel } from "@/components/ui";
 
 const ACTION_LABEL: Record<string, string> = {
   "audit.run": "AUDIT RUN",
-  "artifact.push": "ARTIFACT PUSH",
   "artifact.package": "PACKAGE",
   "config.change": "CONFIG",
 };

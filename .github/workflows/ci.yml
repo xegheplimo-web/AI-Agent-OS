@@ -50,6 +50,42 @@ jobs:
       - name: Push schema
         run: npm run db:push
 
+      # Verify migration SQL files are syntactically valid and apply cleanly.
+      # db:push (above) reconciles schema directly and bypasses the .sql files,
+      # so a broken migration would slip through. We can't use `db:migrate`
+      # because drizzle-kit 0.31.10 has a silent-fail bug on PostgreSQL 17
+      # (applies 0 migrations, exits 1, no error message). Instead we apply
+      # each migration file manually with psql in order against a fresh schema,
+      # which is exactly what db:migrate would do if it worked — and catches
+      # syntax errors, missing objects, and out-of-order dependencies.
+      - name: Verify migration SQL applies on a clean schema
+        run: |
+          if [ ! -d drizzle ] || [ -z "$(find drizzle -maxdepth 1 -name '*.sql' -print -quit)" ]; then
+            echo "::error::No drizzle/*.sql migration files found — run 'npm run db:generate' before release." && exit 1
+          fi
+          # Drop all tables so migrations start from an empty schema.
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+            "DO \$\$ DECLARE r RECORD; BEGIN FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.tablename) || ' CASCADE'; END LOOP; END \$\$;" >/dev/null
+          # Apply each migration file in lexical (chronological) order.
+          for f in $(find drizzle -maxdepth 1 -name '*.sql' | sort); do
+            echo "Applying $f ..."
+            PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -v ON_ERROR_STOP=1 -f "$f" >/dev/null \
+              || { echo "::error::$f failed to apply"; exit 1; }
+          done
+          # Sanity: a core table created by the migrations must exist.
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c "\dt public.audits" | grep -q audits \
+            || (echo "::error::migrations did not create the audits table" && exit 1)
+          # Sanity: the active-audit singleton index exists.
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c "\di public.audits_active_uidx" | grep -q audits_active_uidx \
+            || (echo "::error::migrations did not create the audits_active_uidx index" && exit 1)
+          echo "All $(find drizzle -maxdepth 1 -name '*.sql' | wc -l) migration files applied successfully."
+
+      # Re-push schema after the migration verify step dropped all tables.
+      # The migration verify intentionally destroys the schema to test the
+      # .sql files from scratch; db:push restores it so seed + tests can run.
+      - name: Re-push schema (after migration verify dropped tables)
+        run: npm run db:push
+
       - name: Seed demo data
         run: npm run db:seed
 
@@ -65,6 +101,19 @@ jobs:
       - name: Verify production worker lifecycle
         run: npm run verify:worker
 
+      # Verify non-audit executors (sbom.export, parity.gate,
+      # artifact.package, knowledge.reindex) produce real artifacts with
+      # valid checksums. Catches TAR checksum encoding bugs, bundle
+      # self-inclusion, and metadata format mismatches.
+      - name: Verify non-audit executors
+        run: npm run verify:executors
+        env:
+          APP_MODE: production
+
+      # Verify release artifacts (lockfile, .env.example, Dockerfile, etc.)
+      - name: Verify release readiness
+        run: npm run verify:release
+
       - run: npm run build
 
       - name: Smoke test API
@@ -74,7 +123,39 @@ jobs:
           for i in $(seq 1 30); do
             curl -sf http://localhost:3000/api/health && break || sleep 2
           done
-          curl -sf http://localhost:3000/api/system/health > /dev/null
-          curl -sf http://localhost:3000/api/audits > /dev/null
-          curl -sf http://localhost:3000/api/parity/latest > /dev/null
+          # /api/health is public; the rest require credentials.
+          # Use the service token (maps to worker-service role with system:read).
+          curl -sf http://localhost:3000/api/health > /dev/null
+          curl -sf -H "x-service-token: ci-internal-token" http://localhost:3000/api/system/health > /dev/null
+          curl -sf -H "x-service-token: ci-internal-token" http://localhost:3000/api/audits > /dev/null
+          curl -sf -H "x-service-token: ci-internal-token" http://localhost:3000/api/parity/latest > /dev/null
+          # Verify unauthenticated requests are now rejected (401)
+          UNAUTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/audits)
+          [ "$UNAUTH_STATUS" = "401" ] || (echo "::error::Expected 401 for unauthenticated /api/audits, got $UNAUTH_STATUS" && exit 1)
           kill $SERVER_PID
+
+      # Verify the Docker image builds and the health endpoint responds.
+      # Catches Dockerfile regressions (missing files, wrong paths, broken
+      # standalone output) that wouldn't be caught by the npm build alone.
+      - name: Build Docker image
+        run: docker build -t ai-agent-os:ci .
+
+      - name: Smoke test Docker image
+        run: |
+          # --add-host=host.docker.internal:host-gateway is required on Linux
+          # runners: without it, host.docker.internal does not resolve and the
+          # container cannot reach the service postgres on the host. (Docker
+          # Desktop on macOS/Windows injects this automatically; GitHub runners
+          # are Linux and do not.)
+          docker run -d --name aos-ci -p 3001:3000 \
+            --add-host=host.docker.internal:host-gateway \
+            -e DATABASE_URL=postgresql://agent_os:agent_os@host.docker.internal:5432/agent_os \
+            -e APP_MODE=demo \
+            -e API_INTERNAL_TOKEN=ci-internal-token \
+            -e SESSION_SECRET=ci-session-secret \
+            ai-agent-os:ci
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3001/api/health && break || sleep 2
+          done
+          curl -sf http://localhost:3001/api/health > /dev/null
+          docker stop aos-ci && docker rm aos-ci

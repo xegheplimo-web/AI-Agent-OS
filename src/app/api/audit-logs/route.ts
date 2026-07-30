@@ -2,10 +2,14 @@ import { desc } from "drizzle-orm";
 import { db } from "@/db";
 import { auditLogs } from "@/db/schema";
 import { auditLogDtoSchema, type AuditLogDTO } from "@/lib/contracts";
+import { requirePermission } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
+  const auth = await requirePermission(req, "system:read");
+  if (auth instanceof Response) return auth;
+
   const url = new URL(req.url);
   const limit = Math.min(60, Number(url.searchParams.get("limit") ?? 20));
 

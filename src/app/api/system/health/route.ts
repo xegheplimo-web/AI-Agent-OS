@@ -4,13 +4,17 @@ import { components, jobs, telemetryPoints } from "@/db/schema";
 import type { SystemHealthDTO } from "@/lib/types";
 import { ensureTelemetryFresh } from "@/services/telemetry";
 import { isDemoMode } from "@/services/mode";
+import { requirePermission } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
 const BOOT_TIME = Date.now();
 const WORKER_ALIVE_MS = 45_000;
 
-export async function GET() {
+export async function GET(req: Request) {
+  const auth = await requirePermission(req, "system:read");
+  if (auth instanceof Response) return auth;
+
   await ensureTelemetryFresh();
 
   const rows = await db.select().from(components);
