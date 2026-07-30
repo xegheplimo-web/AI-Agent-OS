@@ -512,28 +512,32 @@ export async function scanDatabase(target?: AuditTarget): Promise<ScanResult> {
       let migrationVersion: string | null = null;
       let migrationLedgerPresent = false;
       try {
-        /* Drizzle's migration ledger is `__drizzle_migrations` in the public
-           schema (or `drizzle.__drizzle_migrations` if a schema was set).
-           The `version` column is a serial int (not string). We check both
-           the default schema and the `drizzle` schema to handle both cases.
-           The `hash` column confirms it's a real drizzle ledger, not a
+        /* Drizzle's PostgreSQL migration ledger is `__drizzle_migrations` in
+           the public schema (or `drizzle.__drizzle_migrations` if a schema
+           was set). The journal columns are `id` (serial), `hash` (text),
+           `created_at` (bigint) — there is NO `version` column. Previously
+           this queried `select version, hash` which always failed with a
+           column-not-found error, so the ledger was always reported absent
+           even on a correctly migrated database. We use `id` as the version
+           surrogate (it increments with each applied migration). The `hash`
+           column confirms it's a real drizzle ledger, not a
            coincidentally-named table. */
-        const journal = await query<{ version: number; hash: string }>(
-          `select version, hash from __drizzle_migrations order by created_at desc limit 1`,
+        const journal = await query<{ id: number; hash: string }>(
+          `select id, hash from __drizzle_migrations order by created_at desc limit 1`,
         );
         if (journal.rows.length) {
-          migrationVersion = String(journal.rows[0].version);
+          migrationVersion = String(journal.rows[0].id);
           migrationLedgerPresent = true;
         }
       } catch {
         /* __drizzle_migrations table doesn't exist in public schema — try
            the drizzle schema, or db:push was used (no ledger). */
         try {
-          const journal = await query<{ version: number; hash: string }>(
-            `select version, hash from drizzle.__drizzle_migrations order by created_at desc limit 1`,
+          const journal = await query<{ id: number; hash: string }>(
+            `select id, hash from drizzle.__drizzle_migrations order by created_at desc limit 1`,
           );
           if (journal.rows.length) {
-            migrationVersion = String(journal.rows[0].version);
+            migrationVersion = String(journal.rows[0].id);
             migrationLedgerPresent = true;
           }
         } catch {

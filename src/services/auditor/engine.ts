@@ -148,6 +148,8 @@ async function assertLease(jobId: string | undefined, leaseToken: string | null 
   if (!rows.length || rows[0].leaseToken !== leaseToken) throw new LeaseLostError();
 }
 
+type TxOrDb = typeof db | import("drizzle-orm/node-postgres").NodePgDatabase<Record<string, never>>;
+
 async function persistArtifact(params: {
   auditId: string;
   kind: string;
@@ -159,7 +161,12 @@ async function persistArtifact(params: {
   tags: string[];
   environment: string;
   metadata?: Record<string, unknown>;
+  /** Optional transaction handle — when provided, the insert runs inside the
+   *  caller's transaction (with its lease guard) instead of a standalone db
+   *  call. This closes the TOCTOU window between assertLease() and the write. */
+  tx?: TxOrDb;
 }) {
+  const conn = params.tx ?? db;
   const bytes = Buffer.byteLength(params.content, "utf-8");
   const row = {
     auditId: params.auditId,
@@ -184,7 +191,7 @@ async function persistArtifact(params: {
   };
   /* Resume-safe: (audit_id, path) is UNIQUE, so a retried stage rewrites
      the artifact instead of inserting a duplicate. */
-  await db
+  await conn
     .insert(artifacts)
     .values(row)
     .onConflictDoUpdate({
@@ -198,6 +205,33 @@ async function persistArtifact(params: {
         updatedAt: row.updatedAt,
       },
     });
+}
+
+/** Run a callback inside a transaction with an atomic lease guard as the
+ *  first statement. The SELECT FOR UPDATE locks the job row for the duration
+ *  of the transaction — if cancelAudit or requeueStaleJobs clears the lease
+ *  concurrently, it blocks until we commit. If the lease is already gone, we
+ *  get 0 rows → LeaseLostError before the callback runs. This closes the
+ *  TOCTOU window between assertLease() and the side-effect writes. */
+async function fencedTx<T>(
+  jobId: string | undefined,
+  leaseToken: string | null | undefined,
+  heartbeatState: { leaseLost: () => boolean },
+  fn: (tx: import("drizzle-orm/node-postgres").NodePgDatabase<Record<string, never>>) => Promise<T>,
+): Promise<T> {
+  if (heartbeatState.leaseLost()) throw new LeaseLostError();
+  if (!jobId || !leaseToken) {
+    /* No lease (demo/inline) — run without guard but still in a transaction
+       so the writes are atomic. */
+    return db.transaction(async (tx) => fn(tx));
+  }
+  return db.transaction(async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT 1 FROM jobs WHERE id = ${jobId} AND lease_token = ${leaseToken} AND status = 'running' FOR UPDATE`,
+    );
+    if (!(rows.rows ?? []).length) throw new LeaseLostError();
+    return fn(tx);
+  });
 }
 
 /**
@@ -251,24 +285,30 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
       await setStages(auditId, stages);
 
       /* Persist the RAW scan envelope immediately — Discovery advertises
-         raw/* artifacts, so they must actually exist in the artifact table. */
-      await persistArtifact({
-        auditId,
-        kind: "json",
-        format: "json",
-        mimeType: "application/json",
-        title: `raw · ${res.scanner}.json`,
-        path: `/audit/raw/${res.scanner}.json`,
-        content: buildInventoryJson(`${res.scanner}.json`, res),
-        tags: ["discovery", "raw", res.scanner],
-        environment,
-        metadata: {
-          stage: "discovery",
-          scanner: res.scanner,
-          status: res.status,
-          audit: audit.name,
-          provenance: targetProvenance(target),
-        },
+         raw/* artifacts, so they must actually exist in the artifact table.
+         The persist is inside a fencedTx so the lease check (SELECT FOR UPDATE)
+         and the artifact insert are atomic — no TOCTOU window between
+         assertLease and the write. */
+      await fencedTx(jobId, leaseToken, hb, async (tx) => {
+        await persistArtifact({
+          auditId,
+          kind: "json",
+          format: "json",
+          mimeType: "application/json",
+          title: `raw · ${res.scanner}.json`,
+          path: `/audit/raw/${res.scanner}.json`,
+          content: buildInventoryJson(`${res.scanner}.json`, res),
+          tags: ["discovery", "raw", res.scanner],
+          environment,
+          metadata: {
+            stage: "discovery",
+            scanner: res.scanner,
+            status: res.status,
+            audit: audit.name,
+            provenance: targetProvenance(target),
+          },
+          tx,
+        });
       });
 
       await setJobProgress(jobId, 5 + Math.round((results.length / scanners.length) * 40), leaseToken);
@@ -303,50 +343,56 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
       { path: "/audit/normalized/scan_results.json", title: "scan_results.json", payload: results },
     ];
 
-    for (const a of normalizedArtifacts) {
-      await persistArtifact({
-        auditId,
-        kind: "json",
-        format: "json",
-        mimeType: "application/json",
-        title: a.title,
-        path: a.path,
-        content: buildInventoryJson(a.title, a.payload),
-        tags: ["normalization", "inventory"],
-        environment,
-        metadata: { stage: "normalization", audit: audit.name },
-      });
-    }
+    /* All normalization artifacts + findings are persisted inside a single
+       fencedTx so the lease check and ALL writes are atomic — a lease loss
+       during this stage cannot leave a partial set of normalized artifacts. */
+    const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+    for (const f of inv.findings) counts[f.severity] += 1;
+
+    await fencedTx(jobId, leaseToken, hb, async (tx) => {
+      for (const a of normalizedArtifacts) {
+        await persistArtifact({
+          auditId,
+          kind: "json",
+          format: "json",
+          mimeType: "application/json",
+          title: a.title,
+          path: a.path,
+          content: buildInventoryJson(a.title, a.payload),
+          tags: ["normalization", "inventory"],
+          environment,
+          metadata: { stage: "normalization", audit: audit.name },
+          tx,
+        });
+      }
+
+      /* real findings → DB (upsert on fingerprint so retries don't duplicate) */
+      for (const f of inv.findings) {
+        const fingerprint = findingFingerprint(f);
+        await tx
+          .insert(findings)
+          .values({
+            auditId,
+            severity: f.severity,
+            category: f.category,
+            component: f.component,
+            title: f.title,
+            description: f.description,
+            evidence: f.evidence,
+            status: "open",
+            fingerprint,
+          })
+          .onConflictDoUpdate({
+            target: [findings.auditId, findings.fingerprint],
+            set: { severity: f.severity, description: f.description, evidence: f.evidence },
+          });
+      }
+    });
 
     stages[1].status = "done";
     stages[1].durationMs = Date.now() - t1;
     stages[1].artifacts = normalizedArtifacts.map((a) => a.path.replace("/audit/", ""));
     await setStages(auditId, stages);
-
-    /* real findings → DB (upsert on fingerprint so retries don't duplicate) */
-    await assertLease(jobId, leaseToken, hb);
-    const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
-    for (const f of inv.findings) {
-      counts[f.severity] += 1;
-      const fingerprint = findingFingerprint(f);
-      await db
-        .insert(findings)
-        .values({
-          auditId,
-          severity: f.severity,
-          category: f.category,
-          component: f.component,
-          title: f.title,
-          description: f.description,
-          evidence: f.evidence,
-          status: "open",
-          fingerprint,
-        })
-        .onConflictDoUpdate({
-          target: [findings.auditId, findings.fingerprint],
-          set: { severity: f.severity, description: f.description, evidence: f.evidence },
-        });
-    }
     await setJobProgress(jobId, 65, leaseToken);
 
     await db.insert(events).values({
@@ -387,6 +433,22 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
 
     const checks = parityChecksFrom(inv, latencyP95, results);
     const { score: parityScore, overallStatus } = computeParityScore(checks);
+
+    /* P1-3: Compute parityGates + effectiveParityStatus BEFORE building the
+       recon artifacts. Previously parity_report.json was created with
+       `overallStatus` (from checks only) while the DB parity report used
+       `effectiveParityStatus` (checks + gates) — the artifact could say
+       "passed/warning" while the DB report said "failed". Now both use the
+       same effective status. */
+    const parityGates = [
+      { key: "secrets_scan", label: "Secrets scan", status: counts.critical > 0 ? "failed" : "passed" },
+      { key: "sbom_diff", label: "SBOM generated", status: "passed" },
+      { key: "endpoint_authz", label: "Endpoint authorization", status: checks.find((c) => c.key === "endpoint_authz")?.status ?? "passed" },
+      { key: "lockfile", label: "Deterministic install (lockfile)", status: (inv.repo as { lockFilePresent?: boolean }).lockFilePresent ? "passed" : "failed" },
+    ];
+    const anyGateFailed = parityGates.some((g) => g.status === "failed");
+    const effectiveParityStatus: "passed" | "warning" | "failed" =
+      anyGateFailed ? "failed" : overallStatus;
 
     const recon = [
       {
@@ -435,28 +497,34 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
           methodology:
             "Behavioural parity measured from live inventory: routes, env contract, DB schema/indexes, endpoint authorization and p95 latency — not source diff.",
           score: parityScore,
-          overallStatus,
+          overallStatus: effectiveParityStatus,
           checks,
+          gates: parityGates,
         }),
         tags: ["parity", "gate"],
       },
     ];
 
-    for (const a of recon) {
-      await assertLease(jobId, leaseToken, hb);
-      await persistArtifact({
-        auditId,
-        kind: a.kind,
-        format: a.format,
-        mimeType: a.mime,
-        title: a.title,
-        path: a.path,
-        content: a.content,
-        tags: a.tags,
-        environment,
-        metadata: { stage: "reconstruction", audit: audit.name },
-      });
-    }
+    /* P0-1: All recon artifacts are persisted inside a single fencedTx so the
+       lease check (SELECT FOR UPDATE) and ALL writes are atomic — a lease
+       loss during reconstruction cannot leave a partial set of artifacts. */
+    await fencedTx(jobId, leaseToken, hb, async (tx) => {
+      for (const a of recon) {
+        await persistArtifact({
+          auditId,
+          kind: a.kind,
+          format: a.format,
+          mimeType: a.mime,
+          title: a.title,
+          path: a.path,
+          content: a.content,
+          tags: a.tags,
+          environment,
+          metadata: { stage: "reconstruction", audit: audit.name },
+          tx,
+        });
+      }
+    });
 
     stages[2].status = "done";
     stages[2].durationMs = Date.now() - t2;
@@ -465,33 +533,18 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
     await setJobProgress(jobId, 92, leaseToken);
 
     /* ---------------- finalize ---------------- */
-    await assertLease(jobId, leaseToken, hb);
     const severityPenalty = counts.critical * 12 + counts.high * 6 + counts.medium * 3 + counts.low * 1;
     const auditScore = Math.max(0, Math.min(100, 100 - severityPenalty));
 
-    const parityGates = [
-      { key: "secrets_scan", label: "Secrets scan", status: counts.critical > 0 ? "failed" : "passed" },
-      { key: "sbom_diff", label: "SBOM generated", status: "passed" },
-      { key: "endpoint_authz", label: "Endpoint authorization", status: checks.find((c) => c.key === "endpoint_authz")?.status ?? "passed" },
-      { key: "lockfile", label: "Deterministic install (lockfile)", status: (inv.repo as { lockFilePresent?: boolean }).lockFilePresent ? "passed" : "failed" },
-    ];
-
-    /* Effective parity status: a failed gate (secrets, lockfile) must
-       escalate the overall status to "failed" even if the check-based
-       score was "passed" or "warning". Previously overallStatus was
-       computed only from checks, so a critical secret finding (gate
-       failed) could still let the audit complete and create a packaging
-       approval. */
-    const anyGateFailed = parityGates.some((g) => g.status === "failed");
-    const effectiveParityStatus: "passed" | "warning" | "failed" =
-      anyGateFailed ? "failed" : overallStatus;
-
     /* The audit→completed, parity report, outcome event and job→completed
-       transitions are committed together. A crash between them used to leave
-       a completed audit with a still-`running` job (or vice versa); the
-       transaction makes the outcome atomic. The approval request and audit
-       log are append-only side effects and stay outside the transaction. */
-    await db.transaction(async (tx) => {
+       transitions are committed together inside a fencedTx — the lease check
+       (SELECT FOR UPDATE) is the first statement, so cancel/requeue cannot
+       clear the lease between the check and the writes. The transaction
+       returns `parityFailed` so the caller knows whether to emit the
+       audit.completed log (P0-2: previously `return` inside the transaction
+       callback did NOT exit runRealAudit, so logAudit ran even when parity
+       failed). */
+    const parityFailed = await fencedTx(jobId, leaseToken, hb, async (tx) => {
       await tx
         .insert(parityReports)
         .values({
@@ -535,13 +588,20 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
           const leaseFilter = leaseToken
             ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken), eq(jobs.status, "running"))
             : eq(jobs.id, jobId);
-          await tx
+          /* P0-2: Check the returning result — if 0 rows matched, the lease
+             was lost (stale supervisor requeued the job). Throw LeaseLostError
+             to abort the transaction so the parity report + audit→failed +
+             event are NOT committed by a worker that lost ownership. */
+          const finalized = await tx
             .update(jobs)
             .set({ status: "failed", progress: 100, finishedAt: new Date(), heartbeatAt: new Date(), updatedAt: new Date(), errorCode: "PARITY_GATE_FAILED", errorMessage: "parity gate failed — packaging blocked" })
             .where(leaseFilter)
             .returning({ id: jobs.id });
+          if (leaseToken && !finalized.length) {
+            throw new LeaseLostError();
+          }
         }
-        return; // do NOT emit audit.completed, do NOT create the packaging approval
+        return true; // parity failed — caller skips audit.completed log
       }
 
       /* Only emit audit.completed when parity is passed or warning. */
@@ -572,10 +632,6 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
          this update matches 0 rows — the worker lost ownership and must not
          finalize. We detect the 0-row case and abort the transaction. */
       if (jobId) {
-        /* Lease filter must check status = 'running' too — cancelAudit sets
-           status = 'cancelled' and clears lease_token. Without the status
-           check, a cancelled job could still be finalized by a stale worker
-           if the token clear hasn't propagated yet (TOCTOU). */
         const leaseFilter = leaseToken
           ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken), eq(jobs.status, "running"))
           : eq(jobs.id, jobId);
@@ -592,14 +648,8 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
       /* The artifact.package approval is created INSIDE the finalize
          transaction so the audit cannot end up "completed" with no packaging
          approval (or vice versa) if one write succeeds and the other fails.
-         Previously this insert ran after the transaction committed, leaving a
-         window where a crash orphaned the approval or the completed audit.
          Parity gate: only created when parity is "passed" or "warning" —
          a "failed" parity blocks packaging (see above). */
-      /* Use raw SQL for the partial-index conflict target — drizzle's
-         onConflictDoNothing doesn't generate the WHERE clause correctly
-         for partial unique indexes. ON CONFLICT (cols) WHERE cond DO
-         NOTHING requires the WHERE to match the index predicate exactly. */
       await tx.execute(sql`
         INSERT INTO approvals (id, action_type, target_type, target_id, title, status, environment, requested_by, payload)
         VALUES (gen_random_uuid(), 'artifact.package', 'audit', ${auditId},
@@ -608,15 +658,22 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
                 ${JSON.stringify({ auditId, target: "audit/recon/bundle.tar.zst", parityStatus: effectiveParityStatus })}::jsonb)
         ON CONFLICT (action_type, target_id) WHERE status = 'pending' DO NOTHING
       `);
+      return false; // parity passed/warning — caller emits audit.completed log
     });
 
-    await logAudit({
-      actor: null,
-      action: "audit.completed",
-      resourceType: "audit",
-      resourceId: auditId,
-      detail: { engine: "real", score: auditScore, parityScore, findings: counts, scanners: results.length },
-    });
+    /* P0-2: Only log audit.completed when parity passed. Previously the
+       `return` inside the transaction callback did NOT exit runRealAudit,
+       so this logAudit ran even when parity failed — recording a "completed"
+       action for an audit that was just marked "failed". */
+    if (!parityFailed) {
+      await logAudit({
+        actor: null,
+        action: "audit.completed",
+        resourceType: "audit",
+        resourceId: auditId,
+        detail: { engine: "real", score: auditScore, parityScore, findings: counts, scanners: results.length },
+      });
+    }
   } catch (err) {
     hb.stop();
 

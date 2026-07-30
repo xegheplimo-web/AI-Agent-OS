@@ -154,11 +154,11 @@ export function normalize(results: ScanResult[]): NormalizedInventory {
   return {
     host: (rtScan?.data ?? {}) as Record<string, unknown>,
     repo: (fsScan?.data ?? {}) as Record<string, unknown>,
-    services: ((routeScan?.data.routes ?? []) as Array<Record<string, unknown>>) ?? [],
-    dependencies: ((pkgScan?.data.components ?? []) as NormalizedInventory["dependencies"]) ?? [],
+    services: (routeScan?.data.routes ?? []) as Array<Record<string, unknown>>,
+    dependencies: (pkgScan?.data.components ?? []) as NormalizedInventory["dependencies"],
     schema: {
-      tables: ((dbScan?.data.tables ?? []) as NormalizedInventory["schema"]["tables"]) ?? [],
-      indexes: ((dbScan?.data.indexes ?? []) as NormalizedInventory["schema"]["indexes"]) ?? [],
+      tables: (dbScan?.data.tables ?? []) as NormalizedInventory["schema"]["tables"],
+      indexes: (dbScan?.data.indexes ?? []) as NormalizedInventory["schema"]["indexes"],
       missingIndexes,
     },
     env: {

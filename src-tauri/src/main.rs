@@ -94,7 +94,24 @@ fn audit_target_root(app: &tauri::AppHandle) -> String {
         .unwrap_or_else(|_| ".".into())
 }
 
+/// Check that the system `node` binary is available. The Tauri installer does
+/// NOT bundle Node — it requires Node 22+ to be installed on the host system.
+/// Without this check, a missing Node produces a cryptic spawn error; with it,
+/// the user gets a clear message explaining the prerequisite.
+fn check_node_runtime() -> bool {
+    match Command::new("node").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).output() {
+        Ok(out) if out.status.success() => true,
+        _ => {
+            eprintln!("[shell] ERROR: Node.js not found on PATH.");
+            eprintln!("[shell]        This app requires Node 22+ to be installed on the system.");
+            eprintln!("[shell]        Download from https://nodejs.org/ and restart the app.");
+            false
+        }
+    }
+}
+
 fn spawn_server(app: &tauri::AppHandle, port: u16) -> Option<Child> {
+    if !check_node_runtime() { return None; }
     let server_js = resource(app, "server/server.js")?;
     println!("[shell] starting control plane on :{port} → {server_js:?}");
     Command::new("node")
@@ -118,7 +135,8 @@ fn spawn_worker(app: &tauri::AppHandle) -> Option<Child> {
         println!("[shell] demo mode: no worker sidecar (inline engine owns the queue)");
         return None;
     }
-    let worker = resource(app, "server/worker/index.js")?;
+    if !check_node_runtime() { return None; }
+    let worker = resource(app, "server/src/worker/index.js")?;
     println!("[shell] starting worker sidecar → {worker:?}");
     Command::new("node")
         .arg(&worker)
