@@ -50,30 +50,35 @@ jobs:
       - name: Push schema
         run: npm run db:push
 
-      # Verify migrations actually APPLY on a clean database. db:push bypasses
+      # Verify migrations actually APPLY on a clean schema. db:push bypasses
       # the migration files (it reconciles schema directly), so a syntactically
-      # broken or out-of-order migration would slip through. Here we create a
-      # FRESH empty database and run `db:migrate` against it — if any .sql file
-      # is malformed or references a missing object, this step fails. This is
-      # the real migration validation; the previous "non-empty file" check only
-      # asserted the files existed.
-      - name: Verify migrations apply on a clean DB
+      # broken or out-of-order migration would slip through. Here we drop +
+      # recreate a dedicated schema and run `db:migrate` against it — if any
+      # .sql file is malformed or references a missing object, this step fails.
+      # We use a schema (not a separate database) because the postgres service
+      # container's user lacks CREATEDB privilege.
+      - name: Verify migrations apply on a clean schema
+        env:
+          MIG_DATABASE_URL: postgresql://agent_os:agent_os@localhost:5432/agent_os?schema=mig_test
         run: |
           if [ ! -d drizzle ] || [ -z "$(find drizzle -name '*.sql' -print -quit)" ]; then
             echo "::error::No drizzle/*.sql migration files found — run 'npm run db:generate' before release." && exit 1
           fi
-          # Create a fresh empty database dedicated to migration verification.
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c "DROP DATABASE IF EXISTS agent_os_mig;" >/dev/null
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c "CREATE DATABASE agent_os_mig;" >/dev/null
-          DATABASE_URL="postgresql://agent_os:agent_os@localhost:5432/agent_os_mig" npm run db:migrate
+          # Drop + recreate the mig_test schema so migrations start from empty.
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c "DROP SCHEMA IF EXISTS mig_test CASCADE; CREATE SCHEMA mig_test;" >/dev/null
+          # drizzle-kit migrate reads DATABASE_URL from env; the ?schema=mig_test
+          # search_path suffix makes drizzle apply migrations into mig_test.
+          DATABASE_URL="$MIG_DATABASE_URL" npm run db:migrate
           # Confirm the migrations table recorded every file (every migration applied).
-          APPLIED=$(PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os_mig -t -c "SELECT count(*) FROM drizzle.__drizzle_migrations;" | tr -d ' ')
+          APPLIED=$(PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -t -c "SELECT count(*) FROM mig_test.__drizzle_migrations;" | tr -d ' ')
           FILES=$(find drizzle -maxdepth 1 -name '*.sql' | wc -l | tr -d ' ')
           echo "Migrations applied: $APPLIED (from $FILES SQL files)"
           [ "$APPLIED" -ge "$FILES" ] || (echo "::error::Not all migrations applied ($APPLIED/$FILES)" && exit 1)
           # Sanity: a core table created by the migrations must exist.
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os_mig -c "\dt audits" | grep -q audits \
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c "\dt mig_test.audits" | grep -q audits \
             || (echo "::error::migrations did not create the audits table" && exit 1)
+          # Clean up the verification schema so it doesn't interfere with seed.
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c "DROP SCHEMA IF EXISTS mig_test CASCADE;" >/dev/null
 
       - name: Seed demo data
         run: npm run db:seed
