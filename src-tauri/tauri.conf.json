@@ -44,7 +44,6 @@
       "../package-lock.json": "server/package-lock.json",
       "../drizzle.config.ts": "server/drizzle.config.ts"
     },
-    "externalBin": ["binaries/node-sidecar"],
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico", "icons/icon.icns"]
   }
 }
