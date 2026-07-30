@@ -160,8 +160,11 @@ async function main() {
   check("its audit is marked failed, not left running", deadAudit.status === "failed", deadAudit.status);
 
   /* ---------- 11. approval decision is atomic -------------------------- */
+  /* Use the stale audit (not the main audit) for the approval test — the
+     main audit already has a pending artifact.package approval from the
+     engine finalize, and the unique partial index blocks a second one. */
   const [appr] = await db.insert(approvals).values({
-    actionType: "artifact.package", targetType: "audit", targetId: auditId,
+    actionType: "artifact.package", targetType: "audit", targetId: staleAudit.id,
     title: "verify concurrency", environment: "local", requestedBy: "verify",
   }).returning();
 
