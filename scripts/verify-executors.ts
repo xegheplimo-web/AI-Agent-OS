@@ -104,9 +104,24 @@ async function main() {
     if (ok) {
       const decoded = Buffer.from(bundle[0].content, "base64");
       check("bundle content is base64-decodable TAR (ustar magic)", decoded.length > 512 && decoded.slice(257, 263).toString("ascii") === "ustar", `${decoded.length}B decoded`);
-      const reChecksum = createHash("sha256").update(decoded.toString("latin1")).digest("hex");
+      /* Hash the raw TAR bytes — NOT decoded.toString("latin1") which
+         re-encodes as UTF-8 and produces a different digest. The executor
+         now uses createHash("sha256").update(tar).digest("hex") on the
+         raw Buffer, so the verifier must match. */
+      const reChecksum = createHash("sha256").update(decoded).digest("hex");
       const declared = (bundle[0].metadata as { checksum?: string })?.checksum ?? "";
-      check("bundle checksum matches the declared sha256", reChecksum === declared, reChecksum.slice(0, 12));
+      check("bundle checksum matches the declared sha256 (raw bytes)", reChecksum === declared, `${reChecksum.slice(0, 12)} vs ${declared.slice(0, 12)}`);
+      /* Verify the checksum file content matches the metadata checksum */
+      const checksumFileContent = checksumRow[0].content.trim().split(/\s+/)[0];
+      check("checksum file content matches metadata checksum", checksumFileContent === declared, checksumFileContent.slice(0, 12));
+      /* Verify the bundle does NOT self-include (re-packaging should
+         exclude previous bundle/checksum artifacts) */
+      const metadata = bundle[0].metadata as { fileCount?: number };
+      const allArtifacts = await db.select().from(artifacts).where(eq(artifacts.auditId, audit.id));
+      const nonBundleArtifacts = allArtifacts.filter((a) => a.path !== "/audit/exports/bundle.tar" && a.path !== "/audit/exports/bundle.tar.sha256");
+      check("bundle does not self-include previous bundle/checksum", metadata.fileCount === nonBundleArtifacts.length, `${metadata.fileCount} files in bundle vs ${nonBundleArtifacts.length} source artifacts`);
+      /* Verify metadata is correct (archive/tar, not json) */
+      check("bundle metadata is archive/tar (not json)", bundle[0].kind === "archive" && bundle[0].format === "tar", `${bundle[0].kind}/${bundle[0].format}`);
     }
   } catch (e) {
     check("artifact.package produced a bundle + checksum artifact", false, (e as Error).message);

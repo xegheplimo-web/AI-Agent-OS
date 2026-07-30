@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { computeParityScore, diffParityChecks } from "@/lib/parity";
 import { parityChecksFrom } from "@/services/auditor/normalize";
-import type { NormalizedInventory } from "@/services/auditor/types";
+import type { NormalizedInventory, ScanResult } from "@/services/auditor/types";
 
 const baseInventory: NormalizedInventory = {
   host: {},
@@ -43,8 +43,10 @@ describe("computeParityScore", () => {
     expect(score).toBe(88);
   });
 
-  it("treats empty as passed", () => {
-    expect(computeParityScore([])).toEqual({ score: 100, overallStatus: "passed" });
+  it("treats empty as failed (fail-closed: no checks ≠ all passed)", () => {
+    /* Previously returned 100/passed — a false-green when no scanner ran.
+       Zero checks means nothing was measured, not that everything passed. */
+    expect(computeParityScore([])).toEqual({ score: 0, overallStatus: "failed" });
   });
 
   it("deducts 2 per pending and marks warning", () => {
@@ -105,6 +107,97 @@ describe("parityChecksFrom — no false-green on unmeasured checks", () => {
 
   it("the overall parity cannot be 'passed' when unmeasured checks are pending", () => {
     const checks = parityChecksFrom(baseInventory, 120);
+    const { overallStatus } = computeParityScore(checks);
+    expect(overallStatus).not.toBe("passed");
+  });
+});
+
+describe("parityChecksFrom — db_schema fail-closed when DB scanner skipped", () => {
+  /* Regression: when the DB scanner is skipped (no TARGET_DATABASE_URL),
+     scannersForTarget omits it entirely, so `results` has no
+     database-inventory entry. Previously db_schema still read "passed"
+     because missingIndexes.length === 0 — a false-green: an unmeasured DB
+     was reported as healthy. It must be "pending" (no evidence). */
+  function scanResult(scanner: string, status: ScanResult["status"]): ScanResult {
+    return {
+      scanner,
+      status,
+      startedAt: "2026-07-30T00:00:00.000Z",
+      finishedAt: "2026-07-30T00:00:00.000Z",
+      durationMs: 1,
+      artifacts: [],
+      warnings: [],
+      error: null,
+      data: {},
+    };
+  }
+
+  it("db_schema is pending when the DB scanner was skipped (no database-inventory result)", () => {
+    const results: ScanResult[] = [
+      scanResult("filesystem-inventory", "success"),
+      scanResult("package-inventory", "success"),
+      scanResult("secret-scan", "success"),
+      /* database-inventory ABSENT — skipped because no TARGET_DATABASE_URL */
+      scanResult("runtime-inventory", "success"),
+      scanResult("route-inventory", "success"),
+    ];
+    const checks = parityChecksFrom(baseInventory, 120, results);
+    const db = checks.find((c) => c.key === "db_schema");
+    expect(db).toBeDefined();
+    expect(db?.status).toBe("pending");
+    expect(db?.currentValue).not.toBe("0 indexes");
+  });
+
+  it("db_schema is pending when scan results are not provided (no evidence of measurement)", () => {
+    /* Fail-closed default: a caller that does not pass scan results cannot
+       prove the DB was measured, so db_schema must not read "passed". */
+    const checks = parityChecksFrom(baseInventory, 120);
+    const db = checks.find((c) => c.key === "db_schema");
+    expect(db?.status).toBe("pending");
+  });
+
+  it("db_schema is pending when the DB scanner ran but FAILED (no usable evidence)", () => {
+    const results: ScanResult[] = [
+      scanResult("database-inventory", "failed"),
+      scanResult("filesystem-inventory", "success"),
+    ];
+    const checks = parityChecksFrom(baseInventory, 120, results);
+    const db = checks.find((c) => c.key === "db_schema");
+    expect(db?.status).toBe("pending");
+  });
+
+  it("db_schema is passed only when the DB scanner ran successfully AND no missing indexes", () => {
+    const inv: NormalizedInventory = {
+      ...baseInventory,
+      schema: { tables: [{ table: "users", columns: 3, rows: 5 }], indexes: [{ table: "users", index: "idx", definition: "" }], missingIndexes: [] },
+    };
+    const results: ScanResult[] = [scanResult("database-inventory", "success")];
+    const checks = parityChecksFrom(inv, 120, results);
+    const db = checks.find((c) => c.key === "db_schema");
+    expect(db?.status).toBe("passed");
+  });
+
+  it("db_schema is warning when the DB scanner ran successfully AND missing indexes exist", () => {
+    const inv: NormalizedInventory = {
+      ...baseInventory,
+      schema: {
+        tables: [{ table: "users", columns: 3, rows: 5 }],
+        indexes: [],
+        missingIndexes: [{ table: "users", column: "email" }],
+      },
+    };
+    const results: ScanResult[] = [scanResult("database-inventory", "success")];
+    const checks = parityChecksFrom(inv, 120, results);
+    const db = checks.find((c) => c.key === "db_schema");
+    expect(db?.status).toBe("warning");
+  });
+
+  it("a skipped DB scanner drags the overall parity off green", () => {
+    const results: ScanResult[] = [
+      scanResult("filesystem-inventory", "success"),
+      scanResult("route-inventory", "success"),
+    ];
+    const checks = parityChecksFrom(baseInventory, 120, results);
     const { overallStatus } = computeParityScore(checks);
     expect(overallStatus).not.toBe("passed");
   });

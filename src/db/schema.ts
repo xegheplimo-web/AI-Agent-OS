@@ -81,6 +81,13 @@ export const audits = pgTable("audits", {
      can silently allow duplicates in some edge cases with concurrent inserts.
      The partial index makes the intent explicit and the constraint airtight. */
   uniqueIndex("audits_idempotency_uidx").on(t.idempotencyKey).where(sql`${t.idempotencyKey} IS NOT NULL`),
+  /* UNIQUE partial index: at most ONE audit may be in an active state
+     (running OR waiting_approval) at any time. The index keys on a constant
+     expression (1) so every active row collides on the same key — a second
+     concurrent insert fails with a unique violation, closing the SELECT-then-
+     INSERT race in startAudit (two requests with different idempotency keys
+     both passing the active check and both inserting). */
+  uniqueIndex("audits_active_uidx").on(sql`1`).where(sql`${t.status} IN ('running', 'waiting_approval')`),
 ]);
 
 /* ------------------------------------------------------------------ */

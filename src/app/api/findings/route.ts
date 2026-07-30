@@ -2,13 +2,16 @@ import { and, desc, eq, ilike, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { events, findings } from "@/db/schema";
 import { advanceIfDemo } from "@/services/audit";
-import { getActor, hasPermission } from "@/lib/auth";
+import { getActor, hasPermission, requirePermission } from "@/lib/auth";
 import { logAudit } from "@/lib/audit-log";
 import { findingDtoSchema, patchFindingSchema, type FindingDTO } from "@/lib/contracts";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
+  const auth = await requirePermission(req, "system:read");
+  if (auth instanceof Response) return auth;
+
   await advanceIfDemo();
 
   const url = new URL(req.url);

@@ -220,6 +220,38 @@ export function hasPermission(actor: Actor | null, permission: Permission): bool
   return !!actor && actor.permissions.includes(permission);
 }
 
+/** Resolve the actor from the request and require a permission.
+ *
+ *  The Edge middleware only checks credential PRESENCE (it cannot verify DB
+ *  sessions at Edge runtime). This helper does the real validation at the
+ *  Node runtime: it calls `getActor` (which validates the session token or
+ *  service token against the database) and checks the required permission.
+ *
+ *  Returns the Actor on success, or a Response (401/403) to send immediately.
+ *  Usage:
+ *    ```
+ *    const auth = await requirePermission(req, "system:read");
+ *    if (auth instanceof Response) return auth;
+ *    // auth is Actor here
+ *    ```
+ */
+export async function requirePermission(req: Request, permission: Permission): Promise<Actor | Response> {
+  const actor = await getActor(req);
+  if (!actor) {
+    return Response.json(
+      { error: "Authentication required — đăng nhập với quyền hợp lệ", code: "AUTH_REQUIRED" },
+      { status: 401 },
+    );
+  }
+  if (!hasPermission(actor, permission)) {
+    return Response.json(
+      { error: `Insufficient permissions — cần quyền ${permission}`, code: "FORBIDDEN" },
+      { status: 403 },
+    );
+  }
+  return actor;
+}
+
 export function getPermissionsForRole(role: Role): Permission[] {
   return ROLE_PERMISSIONS[role] ?? [];
 }

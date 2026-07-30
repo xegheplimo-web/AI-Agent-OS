@@ -2,10 +2,14 @@ import { db } from "@/db";
 import { components } from "@/db/schema";
 import { COMPONENT_DESCRIPTIONS } from "@/lib/audit-data";
 import type { ComponentDTO } from "@/lib/types";
+import { requirePermission } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(req: Request) {
+  const auth = await requirePermission(req, "system:read");
+  if (auth instanceof Response) return auth;
+
   const rows = await db.select().from(components);
   const payload: ComponentDTO[] = rows.map((r) => ({
     id: r.id,

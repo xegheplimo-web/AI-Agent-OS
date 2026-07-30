@@ -77,3 +77,60 @@ describe("session cookie signing (SESSION_SECRET)", () => {
     expect(actor?.permissions).not.toContain("approval:approve");
   });
 });
+
+describe("requirePermission (handler-level auth)", () => {
+  it("returns 401 for a request with no credentials", async () => {
+    const { requirePermission } = await import("@/lib/auth");
+    const req = new Request("http://x");
+    const result = await requirePermission(req, "system:read");
+    expect(result).toBeInstanceOf(Response);
+    expect((result as Response).status).toBe(401);
+  });
+
+  it("returns 401 for a request with a fake cookie (presence-only bypass)", async () => {
+    /* This is the core regression: the Edge middleware checks only that a
+       cookie EXISTS, not that it's valid. A fake cookie like
+       "aos_session=fake-token" passes the middleware but requirePermission
+       calls getActor, which validates the signature and DB session. */
+    const { requirePermission } = await import("@/lib/auth");
+    const req = new Request("http://x", {
+      headers: { cookie: "aos_session=fake-token-that-passes-middleware" },
+    });
+    const result = await requirePermission(req, "system:read");
+    expect(result).toBeInstanceOf(Response);
+    expect((result as Response).status).toBe(401);
+  });
+
+  it("returns 401 for a request with a fake service token", async () => {
+    const { requirePermission } = await import("@/lib/auth");
+    const req = new Request("http://x", {
+      headers: { "x-service-token": "not-a-real-token-1234567890" },
+    });
+    const result = await requirePermission(req, "system:read");
+    expect(result).toBeInstanceOf(Response);
+    expect((result as Response).status).toBe(401);
+  });
+
+  it("returns 403 when the actor lacks the required permission", async () => {
+    const { requirePermission } = await import("@/lib/auth");
+    /* worker-service has system:read but NOT approval:approve */
+    process.env.WORKER_SERVICE_TOKEN = "worker-token-abcdefghijklmnop";
+    const req = new Request("http://x", {
+      headers: { "x-service-token": "worker-token-abcdefghijklmnop" },
+    });
+    const result = await requirePermission(req, "approval:approve");
+    expect(result).toBeInstanceOf(Response);
+    expect((result as Response).status).toBe(403);
+  });
+
+  it("returns the Actor when the actor has the required permission", async () => {
+    const { requirePermission } = await import("@/lib/auth");
+    process.env.WORKER_SERVICE_TOKEN = "worker-token-abcdefghijklmnop";
+    const req = new Request("http://x", {
+      headers: { "x-service-token": "worker-token-abcdefghijklmnop" },
+    });
+    const result = await requirePermission(req, "system:read");
+    expect(result).not.toBeInstanceOf(Response);
+    expect((result as { id: string }).id).toBe("worker-service");
+  });
+});

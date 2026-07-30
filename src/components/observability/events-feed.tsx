@@ -33,6 +33,10 @@ export function EventsFeed({ limit = 14, className }: { limit?: number; classNam
 
   useEffect(() => {
     let es: EventSource | null = null;
+    let disposed = false;
+    const markOffline = () => {
+      if (!disposed) setLive(false);
+    };
     try {
       es = new EventSource("/api/stream/events");
       es.onopen = () => setLive(true);
@@ -54,13 +58,14 @@ export function EventsFeed({ limit = 14, className }: { limit?: number; classNam
         }
       };
       es.onerror = () => {
-        setLive(false);
+        markOffline();
         es?.close();
       };
     } catch {
-      setLive(false);
+      markOffline();
     }
     return () => {
+      disposed = true;
       es?.close();
       setLive(false);
     };

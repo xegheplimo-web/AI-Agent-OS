@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "audits_active_uidx" ON "audits" USING btree (1) WHERE "audits"."status" IN ('running', 'waiting_approval');

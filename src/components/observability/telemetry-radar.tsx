@@ -16,7 +16,11 @@ const BLIPS = [
 
 export function TelemetryRadar({ compact = false }: { compact?: boolean }) {
   const telemetry = useQuery({ queryKey: ["telemetry"], queryFn: api.telemetry, refetchInterval: 6000 });
-  const source = telemetry.data?.source ?? "unavailable";
+  /* Radar has its own source field — always "synthetic" — separate from the
+     main telemetry source. Using telemetry.data.source here would show
+     "otlp live" on the radar badge when the real telemetry source is otlp,
+     even though the radar data is always fabricated. */
+  const radarSource = telemetry.data?.radar?.source ?? "unavailable";
   const r = telemetry.data?.radar;
 
   const size = compact ? 148 : 176;
@@ -31,7 +35,7 @@ export function TelemetryRadar({ compact = false }: { compact?: boolean }) {
 
   return (
     <Panel title="Observability" icon={Radio} tone="cyan">
-      <DataSourceBadge source={source} />
+      <DataSourceBadge source={radarSource} />
       <div className="flex items-center gap-4">
         {/* radar disc */}
         <div className="relative shrink-0 rounded-full border border-cyan/20" style={{ width: size, height: size }}>

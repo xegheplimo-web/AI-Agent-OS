@@ -18,7 +18,7 @@ import { NextResponse, type NextRequest } from "next/server";
 /* Public paths: health check, auth login/logout, and the SSE event
    stream (which sends the session cookie same-origin). */
 const PUBLIC_PATHS = new Set([
-  "/api/system/health",
+  "/api/health",
   "/api/auth/login",
   "/api/auth/logout",
   "/api/auth/me",
