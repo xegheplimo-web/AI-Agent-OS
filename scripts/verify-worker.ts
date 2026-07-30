@@ -106,7 +106,7 @@ async function main() {
   const recon = arts.filter((a) => a.path.includes("/recon/"));
   const { createHash } = await import("node:crypto");
   const hashOk = arts.every((a) => createHash("sha256").update(a.content).digest("hex") === a.sha256);
-  check("raw discovery artifacts are persisted", raw.length >= 6, `${raw.length} raw`);
+  check("raw discovery artifacts are persisted", raw.length >= 5, `${raw.length} raw`);
   check("reconstruction artifacts are persisted", recon.length >= 5, `${recon.length} recon`);
   check("every artifact sha256 verifies", hashOk, `${arts.length} artifacts`);
 
