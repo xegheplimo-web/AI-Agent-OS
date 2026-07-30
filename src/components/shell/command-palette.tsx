@@ -95,15 +95,29 @@ export function CommandPalette() {
   const results = search.data ?? [];
   const total = q.trim().length >= 2 ? results.length : filteredCommands.length;
 
+  /* Reset query and cursor when palette opens. The focus + reset are
+     side-effects of opening (external DOM focus), so an effect is correct
+     here — but we guard the setState calls so they only run on the
+     open transition, not on every render. */
+  const wasOpen = useRef(false);
   useEffect(() => {
-    if (open) {
+    if (open && !wasOpen.current) {
       setQ("");
       setCursor(0);
       setTimeout(() => inputRef.current?.focus(), 30);
     }
+    wasOpen.current = open;
   }, [open]);
 
-  useEffect(() => setCursor(0), [q]);
+  /* Reset cursor when query changes — wrapped in a ref guard so the
+     setState only fires when q actually changes, not on every render. */
+  const prevQ = useRef(q);
+  useEffect(() => {
+    if (prevQ.current !== q) {
+      prevQ.current = q;
+      setCursor(0);
+    }
+  }, [q]);
 
   function pickResult(r: SearchResult) {
     if (r.group === "artifact") {

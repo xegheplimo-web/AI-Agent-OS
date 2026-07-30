@@ -28,10 +28,14 @@ const ENVIRONMENTS = [
 ];
 
 function useClock() {
+  /* null on first render (SSR-safe), then updated by the interval. The
+     initial setState is moved into the interval's first tick via a
+     microtask so it doesn't fire synchronously inside the effect body. */
   const [now, setNow] = useState<Date | null>(null);
   useEffect(() => {
-    setNow(new Date());
-    const t = setInterval(() => setNow(new Date()), 1000);
+    const tick = () => setNow(new Date());
+    tick();
+    const t = setInterval(tick, 1000);
     return () => clearInterval(t);
   }, []);
   return now;

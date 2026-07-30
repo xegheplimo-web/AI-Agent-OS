@@ -2,6 +2,7 @@ import { db } from "@/db";
 import { components } from "@/db/schema";
 import { GRAPH_EDGES } from "@/lib/audit-data";
 import type { ArchitectureGraphDTO, GraphNodeDTO } from "@/lib/types";
+import { requirePermission } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -16,7 +17,10 @@ const ICONS: Record<string, string> = {
   auditor: "scan-search",
 };
 
-export async function GET() {
+export async function GET(req: Request) {
+  const auth = await requirePermission(req, "system:read");
+  if (auth instanceof Response) return auth;
+
   const rows = await db.select().from(components);
   const nodes: GraphNodeDTO[] = rows.map((r) => ({
     id: r.id,

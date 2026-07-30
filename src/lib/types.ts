@@ -81,8 +81,13 @@ export interface TelemetrySummaryDTO {
     errorRate: Array<{ ts: string; value: number }>;
   };
   /* null when source === "unavailable" — the radar panel is decorative and
-   * must not render fabricated traces/metrics/logs counts. */
+   * must not render fabricated traces/metrics/logs counts.
+   *
+   * `radar.source` is always "synthetic" — it is separate from the main
+   * telemetry `source` so the UI never labels fabricated radar numbers as
+   * "otlp live" when the real telemetry source happens to be otlp. */
   radar: {
+    source: "synthetic";
     traces: { active: number; sampledPct: number };
     metrics: { series: number; scrapeOk: number };
     logs: { linesPerMin: number; errorLines: number };

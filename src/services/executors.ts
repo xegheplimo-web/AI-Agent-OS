@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { artifacts, audits, events, jobs, parityReports, settings, telemetryPoints } from "@/db/schema";
 import { computeParityScore } from "@/lib/parity";
 import { GENERATOR_VERSION } from "@/lib/version";
-import { DISCOVERY_SCANNERS } from "@/services/auditor/scanners";
+import { DISCOVERY_SCANNERS, scannersForTarget, scanPackages } from "@/services/auditor/scanners";
 import { normalize, parityChecksFrom } from "@/services/auditor/normalize";
 import { buildInventoryJson, buildRealSbom } from "@/services/auditor/reconstruct";
+import { resolveTarget, targetProvenance } from "@/services/auditor/target";
+import type { LeaseFence } from "@/services/lease";
 import type { JobRow } from "@/db/schema";
 
 /* ------------------------------------------------------------------ */
@@ -86,11 +88,17 @@ async function upsertArtifact(params: {
         },
       });
   } else {
+    /* Global artifact (audit_id IS NULL) — the unique index is a PARTIAL
+       index: `artifacts_global_path_uidx ON (path) WHERE audit_id IS NULL`.
+       PostgreSQL requires the ON CONFLICT clause to include the same WHERE
+       predicate, otherwise it errors with "no unique constraint matching
+       ON CONFLICT". Drizzle's `targetWhere` supplies that predicate. */
     await db
       .insert(artifacts)
       .values(row)
       .onConflictDoUpdate({
         target: [artifacts.path],
+        targetWhere: sql`${artifacts.auditId} IS NULL`,
         set: {
           content: row.content,
           sha256: row.sha256,
@@ -106,22 +114,27 @@ async function upsertArtifact(params: {
 /* ------------------------------------------------------------------ */
 /* sbom.export — re-scan packages and emit a CycloneDX 1.6 SBOM.       */
 /* ------------------------------------------------------------------ */
-export async function executeSbomExport(job: JobRow): Promise<void> {
+export async function executeSbomExport(job: JobRow, lease?: LeaseFence): Promise<void> {
   const environment = job.auditId ? (await loadAuditEnvironment(job.auditId)) : "production";
+  /* Pass the audit's scope so the SBOM only includes what the audit was
+     scoped to — previously this ran all scanners and filtered in JS. */
+  const auditScope = job.auditId ? (await loadAuditScope(job.auditId)) : [];
+  const target = resolveTarget(environment, auditScope);
 
   /* Run only the package-inventory scanner — cheaper than a full discovery
      pass and it is the only one feeding the SBOM. */
-  const results = [];
-  for (const scanner of DISCOVERY_SCANNERS) {
-    const res = await scanner();
-    if (res.scanner === "package-inventory") results.push(res);
-  }
-  if (!results.length) throw new Error("package-inventory scanner did not run");
+  const pkgResult = await scanPackages(target);
+  const results = [pkgResult];
+  if (!results.length || results[0].status === "failed") throw new Error("package-inventory scanner failed");
 
   const inv = normalize(results);
   const auditName = job.auditId ? (await loadAuditName(job.auditId)) : "global-export";
   const sbom = buildRealSbom(auditName, inv);
 
+  /* Lease fencing: abort before the side effect if we lost ownership of the
+     job while the scanner was running. Without this, a stale worker would
+     still write its SBOM artifact after another worker already took over. */
+  await lease?.assert();
   await upsertArtifact({
     auditId: job.auditId ?? null,
     kind: "sbom",
@@ -139,12 +152,18 @@ export async function executeSbomExport(job: JobRow): Promise<void> {
 /* ------------------------------------------------------------------ */
 /* parity.gate — re-scan, normalize, compute parity, persist report.   */
 /* ------------------------------------------------------------------ */
-export async function executeParityGate(job: JobRow): Promise<void> {
+export async function executeParityGate(job: JobRow, lease?: LeaseFence): Promise<void> {
   const environment = job.auditId ? (await loadAuditEnvironment(job.auditId)) : "production";
+  const auditScope = job.auditId ? (await loadAuditScope(job.auditId)) : [];
+  const target = resolveTarget(environment, auditScope);
 
+  /* Use target-aware scanner selection — only run scanners whose scope is
+     enabled for this audit. Previously this ran ALL scanners regardless
+     of the audit's scope filter. */
+  const scanners = scannersForTarget(target);
   const results = [];
-  for (const scanner of DISCOVERY_SCANNERS) {
-    results.push(await scanner());
+  for (const { run } of scanners) {
+    results.push(await run());
   }
   const inv = normalize(results);
 
@@ -157,7 +176,7 @@ export async function executeParityGate(job: JobRow): Promise<void> {
     .limit(1);
   const latencyP95: number | null = p95Rows.length ? p95Rows[0].value : null;
 
-  const checks = parityChecksFrom(inv, latencyP95);
+  const checks = parityChecksFrom(inv, latencyP95, results);
   const { score, overallStatus } = computeParityScore(checks);
 
   const gates = [
@@ -167,12 +186,18 @@ export async function executeParityGate(job: JobRow): Promise<void> {
     { key: "lockfile", label: "Deterministic install (lockfile)", status: (inv.repo as { lockFilePresent?: boolean }).lockFilePresent ? "passed" : "failed" },
   ];
 
+  /* Lease fencing before persisting the parity report — a stale worker must
+     not overwrite a report another worker already produced. */
+  await lease?.assert();
   if (job.auditId) {
+    /* Partial unique index: parity_audit_uidx ON (audit_id) WHERE audit_id IS NOT NULL.
+       Must include targetWhere or PostgreSQL rejects the ON CONFLICT. */
     await db
       .insert(parityReports)
       .values({ auditId: job.auditId, overallStatus, score, environment, checks, gates })
       .onConflictDoUpdate({
         target: [parityReports.auditId],
+        targetWhere: sql`${parityReports.auditId} IS NOT NULL`,
         set: { overallStatus, score, checks, gates, environment },
       });
   } else {
@@ -181,6 +206,7 @@ export async function executeParityGate(job: JobRow): Promise<void> {
   }
 
   /* Also persist the parity report as a queryable artifact. */
+  await lease?.assert();
   await upsertArtifact({
     auditId: job.auditId ?? null,
     kind: "json",
@@ -248,66 +274,88 @@ function buildTar(files: Array<{ name: string; content: Buffer }>): Buffer {
   return Buffer.concat(parts);
 }
 
-export async function executeArtifactPackage(job: JobRow): Promise<void> {
+export async function executeArtifactPackage(job: JobRow, lease?: LeaseFence): Promise<void> {
   if (!job.auditId) throw new Error("artifact.package requires an auditId — nothing to package for a global job");
   const environment = await loadAuditEnvironment(job.auditId);
+  const auditScope = await loadAuditScope(job.auditId);
+  const target = resolveTarget(environment, auditScope);
+
+  /* Exclude previous bundle/checksum artifacts from the new bundle — without
+     this, re-packaging includes the old bundle inside the new one, making the
+     archive grow on each run and breaking idempotency. */
+  const BUNDLE_PATHS = new Set(["/audit/exports/bundle.tar", "/audit/exports/bundle.tar.sha256"]);
 
   const rows = await db
     .select()
     .from(artifacts)
-    .where(eq(artifacts.auditId, job.auditId))
+    .where(and(eq(artifacts.auditId, job.auditId)))
     .orderBy(desc(artifacts.updatedAt));
 
-  if (!rows.length) throw new Error(`no artifacts found for audit ${job.auditId}`);
+  const bundleable = rows.filter((r) => !BUNDLE_PATHS.has(r.path));
+  if (!bundleable.length) throw new Error(`no artifacts found for audit ${job.auditId}`);
 
   const manifest = {
     auditId: job.auditId,
     generatedAt: new Date().toISOString(),
     generator: "ai-system-auditor",
     generatorVersion: GENERATOR_VERSION,
-    fileCount: rows.length,
-    files: rows.map((r) => ({
+    fileCount: bundleable.length,
+    files: bundleable.map((r) => ({
       path: r.path,
       kind: r.kind,
       sha256: r.sha256,
       sizeBytes: r.sizeBytes,
     })),
+    provenance: targetProvenance(target),
   };
   const manifestJson = JSON.stringify(manifest, null, 2);
 
   const tarFiles: Array<{ name: string; content: Buffer }> = [
     { name: "MANIFEST.json", content: Buffer.from(manifestJson, "utf-8") },
-    ...rows.map((r) => ({
+    ...bundleable.map((r) => ({
       name: r.path.replace(/^\//, "").replace(/\//g, "_"),
       content: Buffer.from(r.content, "utf-8"),
     })),
   ];
 
   const tar = buildTar(tarFiles);
-  const checksum = sha256(tar.toString("latin1"));
+  /* Hash the raw TAR bytes, not a latin1-decoded string re-encoded as UTF-8.
+     The previous `sha256(tar.toString("latin1"))` produced a different digest
+     than `sha256(tar)` because Node's createHash defaults to UTF-8 encoding
+     for string inputs — the checksum did not match the actual archive bytes. */
+  const checksum = createHash("sha256").update(tar).digest("hex");
   const tarB64 = tar.toString("base64");
 
-  /* Persist the bundle as an artifact. The TAR is stored base64 in `content`
-     (db storage provider) — large-payload-to-disk is a later optimization
-     (storageProvider=filesystem). The checksum lets a receiver verify it. */
+  /* Persist the bundle as an artifact. Correct metadata: this is a TAR
+     archive, not JSON — the previous kind/format/mimeType were all "json"
+     which misled the artifact browser. */
+  await lease?.assert();
   await upsertArtifact({
     auditId: job.auditId,
-    kind: "json",
-    format: "json",
-    mimeType: "application/json",
+    kind: "archive",
+    format: "tar",
+    mimeType: "application/x-tar",
     title: "bundle.tar (base64) + checksum",
     path: "/audit/exports/bundle.tar",
     content: tarB64,
     tags: ["bundle", "tar", "export"],
     environment,
-    metadata: { job: job.id, jobType: job.type, checksum, fileCount: rows.length, encoding: "base64" },
+    metadata: {
+      job: job.id,
+      jobType: job.type,
+      checksum,
+      fileCount: bundleable.length,
+      encoding: "base64",
+      provenance: targetProvenance(target),
+    },
   });
 
+  await lease?.assert();
   await upsertArtifact({
     auditId: job.auditId,
-    kind: "json",
-    format: "json",
-    mimeType: "application/json",
+    kind: "text",
+    format: "sha256",
+    mimeType: "text/plain",
     title: "bundle.tar.sha256",
     path: "/audit/exports/bundle.tar.sha256",
     content: `${checksum}  bundle.tar\n`,
@@ -328,23 +376,62 @@ const STOPWORDS = new Set([
   "import", "export", "const", "let", "var", "function", "return", "class", "interface", "type", "void",
 ]);
 
-function tokenize(text: string): string[] {
+/** Tokenize text for the inverted index. Splits on whitespace and
+ *  punctuation but preserves Unicode letters (Vietnamese diacritics,
+ *  CJK, etc.) — the previous `[^a-z0-9_]` regex stripped all non-ASCII
+ *  characters, making Vietnamese search impossible. */
+export function tokenize(text: string): string[] {
   return text
     .toLowerCase()
-    .split(/[^a-z0-9_]+/)
-    .filter((t) => t.length >= 3 && t.length <= 40 && !STOPWORDS.has(t));
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((t) => t.length >= 2 && t.length <= 40 && !STOPWORDS.has(t));
 }
 
-export async function executeKnowledgeReindex(job: JobRow): Promise<void> {
-  const environment = job.auditId ? (await loadAuditEnvironment(job.auditId)) : "production";
+/** Shape of the persisted inverted index. Exported so the search route and
+ *  tests can reference the same contract. */
+export interface KnowledgeIndex {
+  generatedAt: string;
+  generator: string;
+  generatorVersion: string;
+  docCount: number;
+  termCount: number;
+  docLengths: Record<number, number>;
+  postings: Record<string, Array<{ artifactId: number; path: string; tf: number }>>;
+  lastScopedAudit: string | null;
+  auditDocs: Record<string, number[]>;
+}
 
-  /* Index all artifacts (optionally scoped to an audit). */
-  const rows = job.auditId
-    ? await db.select().from(artifacts).where(eq(artifacts.auditId, job.auditId))
-    : await db.select().from(artifacts);
-
+/** Pure merge/rebuild of the inverted index. Extracted from
+ *  executeKnowledgeReindex so the scoped-deletion and Unicode behavior can be
+ *  unit-tested without a database.
+ *
+ *  - `existing` is the prior global index (null on first build / global reindex).
+ *  - `rows` are the artifacts to index now.
+ *  - `auditId` is non-null for a scoped reindex: postings for the audit's
+ *    PREVIOUS artifacts (recorded in `auditDocs`) are evicted along with the
+ *    current ones, so artifacts deleted between runs no longer linger as
+ *    orphan search hits. */
+export function buildMergedIndex(
+  existing: { postings: KnowledgeIndex["postings"]; docLengths: Record<number, number>; auditDocs?: Record<string, number[]> } | null,
+  rows: Array<{ id: number; title: string; path: string; content: string }>,
+  auditId: string | null,
+): KnowledgeIndex {
   const inverted: Record<string, Array<{ artifactId: number; path: string; tf: number }>> = {};
   const docLengths: Record<number, number> = {};
+  const auditDocs: Record<string, number[]> = { ...(existing?.auditDocs ?? {}) };
+
+  const currentIds = new Set(rows.map((r) => r.id));
+  if (existing && auditId) {
+    const previousIds = existing.auditDocs?.[auditId] ?? [];
+    const evictIds = new Set<number>([...previousIds, ...currentIds]);
+    for (const [tok, postings] of Object.entries(existing.postings)) {
+      const kept = postings.filter((p) => !evictIds.has(p.artifactId));
+      if (kept.length) inverted[tok] = kept;
+    }
+    for (const [id, len] of Object.entries(existing.docLengths)) {
+      if (!evictIds.has(Number(id))) docLengths[Number(id)] = len;
+    }
+  }
 
   for (const row of rows) {
     const tokens = tokenize(`${row.title} ${row.path} ${row.content}`);
@@ -357,16 +444,53 @@ export async function executeKnowledgeReindex(job: JobRow): Promise<void> {
     }
   }
 
-  const index = {
+  if (auditId) auditDocs[auditId] = rows.map((r) => r.id);
+
+  return {
     generatedAt: new Date().toISOString(),
     generator: "ai-system-auditor",
     generatorVersion: GENERATOR_VERSION,
-    docCount: rows.length,
+    docCount: Object.keys(docLengths).length,
     termCount: Object.keys(inverted).length,
     docLengths,
     postings: inverted,
+    lastScopedAudit: auditId,
+    auditDocs,
   };
+}
 
+export async function executeKnowledgeReindex(job: JobRow, lease?: LeaseFence): Promise<void> {
+  const environment = job.auditId ? (await loadAuditEnvironment(job.auditId)) : "production";
+
+  /* Index all artifacts. When scoped to an audit, MERGE into the existing
+     global index instead of overwriting it — previously a per-audit reindex
+     would replace the global index with one containing only that audit's
+     artifacts, making all other artifacts unsearchable. */
+  const rows = job.auditId
+    ? await db.select().from(artifacts).where(eq(artifacts.auditId, job.auditId))
+    : await db.select().from(artifacts);
+
+  /* Load existing global index to merge into (if this is a scoped reindex). */
+  type IndexShape = {
+    postings: Record<string, Array<{ artifactId: number; path: string; tf: number }>>;
+    docLengths: Record<number, number>;
+    auditDocs?: Record<string, number[]>;
+  };
+  let existingIndex: IndexShape | null = null;
+  if (job.auditId) {
+    const existing = await db.select().from(settings).where(eq(settings.key, "knowledge.invertedIndex")).limit(1);
+    if (existing.length) {
+      existingIndex = existing[0].value as IndexShape;
+    }
+  }
+
+  /* Pure merge/rebuild — see buildMergedIndex. Evicts postings for the
+     audit's previous artifacts (including deleted ones) before re-inserting. */
+  const index = buildMergedIndex(existingIndex, rows, job.auditId);
+
+  /* Lease fencing before persisting the merged index — a stale worker must
+     not overwrite the index another worker already rebuilt. */
+  await lease?.assert();
   await db
     .insert(settings)
     .values({ key: "knowledge.invertedIndex", value: index })
@@ -374,6 +498,7 @@ export async function executeKnowledgeReindex(job: JobRow): Promise<void> {
 
   /* Persist a manifest artifact so the reindex is visible in the artifact
      browser and has a sha256 like every other export. */
+  await lease?.assert();
   await upsertArtifact({
     auditId: job.auditId ?? null,
     kind: "json",
@@ -384,7 +509,8 @@ export async function executeKnowledgeReindex(job: JobRow): Promise<void> {
     content: buildInventoryJson("knowledge_index_manifest.json", {
       docCount: index.docCount,
       termCount: index.termCount,
-      scopedToAudit: job.auditId ?? null,
+      lastScopedAudit: job.auditId ?? null,
+      auditDocCounts: Object.fromEntries(Object.entries(index.auditDocs).map(([k, v]) => [k, v.length])),
     }),
     tags: ["knowledge", "inverted-index", "export"],
     environment,
@@ -395,7 +521,7 @@ export async function executeKnowledgeReindex(job: JobRow): Promise<void> {
 /* ------------------------------------------------------------------ */
 /* Dispatch + helpers.                                                 */
 /* ------------------------------------------------------------------ */
-export type Executor = (job: JobRow) => Promise<void>;
+export type Executor = (job: JobRow, lease?: LeaseFence) => Promise<void>;
 
 const EXECUTORS: Record<string, Executor> = {
   "sbom.export": executeSbomExport,
@@ -410,11 +536,12 @@ export function hasExecutor(jobType: string): boolean {
 
 /** Run the executor for a job. Throws if the job type has no executor — the
  *  caller must mark the job failed with errorCode NO_EXECUTOR rather than
- *  silently completing it. */
-export async function runExecutor(job: JobRow): Promise<void> {
+ *  silently completing it. The optional `lease` lets the executor abort
+ *  (LeaseLostError) before each side effect if it lost job ownership. */
+export async function runExecutor(job: JobRow, lease?: LeaseFence): Promise<void> {
   const exec = EXECUTORS[job.type];
   if (!exec) throw new Error(`NO_EXECUTOR: no executor registered for job type "${job.type}"`);
-  await exec(job);
+  await exec(job, lease);
 }
 
 async function loadAuditEnvironment(auditId: string): Promise<string> {
@@ -425,4 +552,9 @@ async function loadAuditEnvironment(auditId: string): Promise<string> {
 async function loadAuditName(auditId: string): Promise<string> {
   const rows = await db.select().from(audits).where(eq(audits.id, auditId)).limit(1);
   return rows[0]?.name ?? auditId.slice(0, 8);
+}
+
+async function loadAuditScope(auditId: string): Promise<string[]> {
+  const rows = await db.select().from(audits).where(eq(audits.id, auditId)).limit(1);
+  return rows[0]?.scope ?? [];
 }

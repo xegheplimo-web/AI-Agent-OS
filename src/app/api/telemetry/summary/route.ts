@@ -5,6 +5,7 @@ import { ensureEventFreshIfDemo } from "@/services/audit";
 import { ensureTelemetryFresh } from "@/services/telemetry";
 import { isDemoMode } from "@/services/mode";
 import type { TelemetrySource, TelemetrySummaryDTO } from "@/lib/types";
+import { requirePermission } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -18,7 +19,10 @@ async function seriesOf(metric: string, limit = 30) {
   return rows.reverse().map((r) => ({ ts: r.ts.toISOString(), value: r.value }));
 }
 
-export async function GET() {
+export async function GET(req: Request) {
+  const auth = await requirePermission(req, "system:read");
+  if (auth instanceof Response) return auth;
+
   await ensureTelemetryFresh();
   await ensureEventFreshIfDemo();
 
@@ -63,12 +67,13 @@ export async function GET() {
 
   /* The radar panel (traces/metrics/logs/baggage) is decorative and has no
    * real backing data source in either mode. It is only returned when there
-   * is telemetry at all, and its origin is always synthetic — the UI badge
-   * discloses that. Returning it on `unavailable` would render fabricated
-   * counts on a system with no collector. */
+   * is telemetry at all, and its origin is always "synthetic" — separate
+   * from the main telemetry source so the UI badge never labels fabricated
+   * radar numbers as "otlp live". */
   const seed = new Date().getMinutes();
   const radar = hasData
     ? {
+        source: "synthetic" as const,
         traces: { active: 480 + ((seed * 13) % 90), sampledPct: 12.4 },
         metrics: { series: 482, scrapeOk: 100 },
         logs: { linesPerMin: 17600 + ((seed * 89) % 2400), errorLines: Math.round(38 + (last(err) ?? 0) * 60) },

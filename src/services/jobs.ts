@@ -6,6 +6,7 @@ import { logAudit } from "@/lib/audit-log";
 import { jobDtoSchema, type JobDTO } from "@/lib/contracts";
 import { isDemoMode } from "@/services/mode";
 import { hasExecutor, runExecutor } from "@/services/executors";
+import { createLeaseFence, LeaseLostError } from "@/services/lease";
 
 /* ------------------------------------------------------------------ */
 /* Job service — DB-backed queue. Demo mode advances jobs inline; in   */
@@ -52,7 +53,7 @@ export async function enqueueJob(
       status: isDemoMode ? "running" : "queued",
       target,
       progress: 0,
-      attempt: 1,
+      attempt: 0,
       worker: isDemoMode ? "inline-demo" : null,
       lockedBy: isDemoMode ? "inline-demo" : null,
       heartbeatAt: new Date(),
@@ -95,8 +96,18 @@ export async function advanceJobsOnce(workerId?: string): Promise<void> {
      * wall-clock simulation in production: a job that has no executor is a
      * configuration error, not a "slow" job. */
     if (!isDemoMode && hasExecutor(job.type)) {
+      /* Background heartbeat + lease fence: a long executor (e.g.
+         artifact.package on a large audit) could exceed the 45s stale-
+         recovery threshold. The fence heartbeats every 15s AND gives the
+         executor an `assert()` it must call before each side effect, so a
+         stale worker aborts the moment it loses ownership instead of
+         continuing to write artifacts/reports that clobber the new owner's
+         run. */
+      const fence = createLeaseFence(job.id, job.leaseToken);
+
       try {
-        await runExecutor(job);
+        if (fence.leaseLost()) throw new LeaseLostError();
+        await runExecutor(job, fence);
         /* Lease fencing: only mark completed if we still own the job. If the
            stale supervisor requeued it (clearing lease_token) and another
            worker claimed it, this update is a no-op — we lost ownership
@@ -125,20 +136,49 @@ export async function advanceJobsOnce(workerId?: string): Promise<void> {
           });
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const leaseFilter = job.leaseToken
-          ? and(eq(jobs.id, job.id), eq(jobs.leaseToken, job.leaseToken))
-          : eq(jobs.id, job.id);
-        await db
-          .update(jobs)
-          .set({ status: "failed", finishedAt: new Date(), heartbeatAt: new Date(), updatedAt: new Date(), errorMessage: message })
-          .where(leaseFilter);
-        await db.insert(events).values({
-          type: "job.failed",
-          severity: "error",
-          source: job.worker ?? job.lockedBy ?? "worker",
-          message: `${job.type} failed for ${job.target}: ${message}`,
-        });
+        /* LEASE_LOST is silent: the worker lost ownership (stale supervisor
+           requeued the job, another worker claimed it). The new owner will
+           handle it. This worker must NOT mark the job failed/retried or emit
+           a failure event — that would race the new owner's completion. */
+        if (err instanceof LeaseLostError) {
+          await db.insert(events).values({
+            type: "job.requeued",
+            severity: "warning",
+            source: job.worker ?? job.lockedBy ?? "worker",
+            message: `${job.type} for ${job.target}: lease lost during executor — aborting, another worker owns this job now`,
+          });
+        } else {
+          const message = err instanceof Error ? err.message : String(err);
+          const leaseFilter = job.leaseToken
+            ? and(eq(jobs.id, job.id), eq(jobs.leaseToken, job.leaseToken))
+            : eq(jobs.id, job.id);
+          /* Retry while attempts remain — previously this always set status=
+             'failed', ignoring maxAttempts. A transient executor error (e.g.
+             DB blip during SBOM export) would permanently fail the job instead
+             of giving it the configured retry budget. */
+          const exhausted = job.attempt >= job.maxAttempts;
+          await db
+            .update(jobs)
+            .set({
+              status: exhausted ? "failed" : "queued",
+              lockedBy: null,
+              leaseToken: null,
+              worker: exhausted ? job.worker : null,
+              finishedAt: exhausted ? new Date() : null,
+              heartbeatAt: new Date(),
+              updatedAt: new Date(),
+              errorMessage: message,
+            })
+            .where(leaseFilter);
+          await db.insert(events).values({
+            type: exhausted ? "job.failed" : "job.requeued",
+            severity: "error",
+            source: job.worker ?? job.lockedBy ?? "worker",
+            message: `${job.type} ${exhausted ? "failed" : "requeued for retry"} for ${job.target}: ${message}`,
+          });
+        }
+      } finally {
+        fence.stop();
       }
       continue;
     }

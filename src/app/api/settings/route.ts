@@ -5,7 +5,7 @@ import {
   PRODUCTION_RULES_DEFAULT,
   WORKSPACE_DEFAULT,
 } from "@/lib/audit-data";
-import { getActor, hasPermission } from "@/lib/auth";
+import { getActor, hasPermission, requirePermission } from "@/lib/auth";
 import { logAudit } from "@/lib/audit-log";
 import type { SettingsDTO } from "@/lib/types";
 import { z } from "zod";
@@ -22,7 +22,10 @@ async function readAll(): Promise<SettingsDTO> {
   };
 }
 
-export async function GET() {
+export async function GET(req: Request) {
+  const auth = await requirePermission(req, "system:read");
+  if (auth instanceof Response) return auth;
+
   return Response.json(await readAll());
 }
 

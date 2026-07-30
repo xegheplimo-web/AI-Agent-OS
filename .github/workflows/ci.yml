@@ -50,6 +50,31 @@ jobs:
       - name: Push schema
         run: npm run db:push
 
+      # Verify migrations actually APPLY on a clean database. db:push bypasses
+      # the migration files (it reconciles schema directly), so a syntactically
+      # broken or out-of-order migration would slip through. Here we create a
+      # FRESH empty database and run `db:migrate` against it — if any .sql file
+      # is malformed or references a missing object, this step fails. This is
+      # the real migration validation; the previous "non-empty file" check only
+      # asserted the files existed.
+      - name: Verify migrations apply on a clean DB
+        run: |
+          if [ ! -d drizzle ] || [ -z "$(find drizzle -name '*.sql' -print -quit)" ]; then
+            echo "::error::No drizzle/*.sql migration files found — run 'npm run db:generate' before release." && exit 1
+          fi
+          # Create a fresh empty database dedicated to migration verification.
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c "DROP DATABASE IF EXISTS agent_os_mig;" >/dev/null
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c "CREATE DATABASE agent_os_mig;" >/dev/null
+          DATABASE_URL="postgresql://agent_os:agent_os@localhost:5432/agent_os_mig" npm run db:migrate
+          # Confirm the migrations table recorded every file (every migration applied).
+          APPLIED=$(PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os_mig -t -c "SELECT count(*) FROM drizzle.__drizzle_migrations;" | tr -d ' ')
+          FILES=$(find drizzle -maxdepth 1 -name '*.sql' | wc -l | tr -d ' ')
+          echo "Migrations applied: $APPLIED (from $FILES SQL files)"
+          [ "$APPLIED" -ge "$FILES" ] || (echo "::error::Not all migrations applied ($APPLIED/$FILES)" && exit 1)
+          # Sanity: a core table created by the migrations must exist.
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os_mig -c "\dt audits" | grep -q audits \
+            || (echo "::error::migrations did not create the audits table" && exit 1)
+
       - name: Seed demo data
         run: npm run db:seed
 
@@ -65,6 +90,19 @@ jobs:
       - name: Verify production worker lifecycle
         run: npm run verify:worker
 
+      # Verify non-audit executors (sbom.export, parity.gate,
+      # artifact.package, knowledge.reindex) produce real artifacts with
+      # valid checksums. Catches TAR checksum encoding bugs, bundle
+      # self-inclusion, and metadata format mismatches.
+      - name: Verify non-audit executors
+        run: npm run verify:executors
+        env:
+          APP_MODE: production
+
+      # Verify release artifacts (lockfile, .env.example, Dockerfile, etc.)
+      - name: Verify release readiness
+        run: npm run verify:release
+
       - run: npm run build
 
       - name: Smoke test API
@@ -74,7 +112,39 @@ jobs:
           for i in $(seq 1 30); do
             curl -sf http://localhost:3000/api/health && break || sleep 2
           done
-          curl -sf http://localhost:3000/api/system/health > /dev/null
-          curl -sf http://localhost:3000/api/audits > /dev/null
-          curl -sf http://localhost:3000/api/parity/latest > /dev/null
+          # /api/health is public; the rest require credentials.
+          # Use the service token (maps to worker-service role with system:read).
+          curl -sf http://localhost:3000/api/health > /dev/null
+          curl -sf -H "x-service-token: ci-internal-token" http://localhost:3000/api/system/health > /dev/null
+          curl -sf -H "x-service-token: ci-internal-token" http://localhost:3000/api/audits > /dev/null
+          curl -sf -H "x-service-token: ci-internal-token" http://localhost:3000/api/parity/latest > /dev/null
+          # Verify unauthenticated requests are now rejected (401)
+          UNAUTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/audits)
+          [ "$UNAUTH_STATUS" = "401" ] || (echo "::error::Expected 401 for unauthenticated /api/audits, got $UNAUTH_STATUS" && exit 1)
           kill $SERVER_PID
+
+      # Verify the Docker image builds and the health endpoint responds.
+      # Catches Dockerfile regressions (missing files, wrong paths, broken
+      # standalone output) that wouldn't be caught by the npm build alone.
+      - name: Build Docker image
+        run: docker build -t ai-agent-os:ci .
+
+      - name: Smoke test Docker image
+        run: |
+          # --add-host=host.docker.internal:host-gateway is required on Linux
+          # runners: without it, host.docker.internal does not resolve and the
+          # container cannot reach the service postgres on the host. (Docker
+          # Desktop on macOS/Windows injects this automatically; GitHub runners
+          # are Linux and do not.)
+          docker run -d --name aos-ci -p 3001:3000 \
+            --add-host=host.docker.internal:host-gateway \
+            -e DATABASE_URL=postgresql://agent_os:agent_os@host.docker.internal:5432/agent_os \
+            -e APP_MODE=demo \
+            -e API_INTERNAL_TOKEN=ci-internal-token \
+            -e SESSION_SECRET=ci-session-secret \
+            ai-agent-os:ci
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3001/api/health && break || sleep 2
+          done
+          curl -sf http://localhost:3001/api/health > /dev/null
+          docker stop aos-ci && docker rm aos-ci

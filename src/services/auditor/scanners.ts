@@ -4,8 +4,11 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import { sql } from "drizzle-orm";
+import { Pool } from "pg";
 import { getDb } from "@/db";
 import { startScan, type RawFinding, type ScanResult } from "@/services/auditor/types";
+import type { AuditTarget, Scope } from "@/services/auditor/target";
+import { scopeEnabled, databaseScopeEnabled } from "@/services/auditor/target";
 
 /* ------------------------------------------------------------------ */
 /* REAL discovery scanners.                                            */
@@ -18,28 +21,21 @@ import { startScan, type RawFinding, type ScanResult } from "@/services/auditor/
 /* "DB: SELECT only / inspect only / no mutate on production" rules.   */
 /* ------------------------------------------------------------------ */
 
-/**
- * Audit target.
- *
- * `process.cwd()` is only correct when the worker runs from the repository.
- * Once packaged (Tauri resources, a container, a service), the working
- * directory is the server bundle — not the code under audit. AUDIT_TARGET_ROOT
- * makes the target explicit and lets the desktop shell point the auditor at
- * whichever repository the operator selected.
- */
-const ROOT = path.resolve(process.env.AUDIT_TARGET_ROOT ?? process.cwd());
+/* Legacy helpers kept for verify-executors.ts and other callers that
+   haven't been migrated to the target-aware API yet. */
+const LEGACY_ROOT = path.resolve(process.env.AUDIT_TARGET_ROOT ?? process.cwd());
 
 /** True when the target really looks like a source repository. */
 export function targetLooksValid(): { valid: boolean; reason?: string } {
-  if (!existsSync(ROOT)) return { valid: false, reason: `AUDIT_TARGET_ROOT does not exist: ${ROOT}` };
-  if (!existsSync(path.join(ROOT, "package.json"))) {
-    return { valid: false, reason: `no package.json under ${ROOT} — auditing a packaged bundle instead of a repository?` };
+  if (!existsSync(LEGACY_ROOT)) return { valid: false, reason: `AUDIT_TARGET_ROOT does not exist: ${LEGACY_ROOT}` };
+  if (!existsSync(path.join(LEGACY_ROOT, "package.json"))) {
+    return { valid: false, reason: `no package.json under ${LEGACY_ROOT} — auditing a packaged bundle instead of a repository?` };
   }
   return { valid: true };
 }
 
 export function auditTargetRoot(): string {
-  return ROOT;
+  return LEGACY_ROOT;
 }
 
 const SKIP_DIRS = new Set([
@@ -63,7 +59,8 @@ interface FileEntry {
   lines: number;
 }
 
-async function walk(dir: string, acc: FileEntry[], depth = 0): Promise<void> {
+async function walk(dir: string, acc: FileEntry[], depth = 0, root?: string): Promise<void> {
+  const basePath = root ?? LEGACY_ROOT;
   if (depth > 8) return;
   let entries;
   try {
@@ -76,7 +73,7 @@ async function walk(dir: string, acc: FileEntry[], depth = 0): Promise<void> {
     if (SKIP_DIRS.has(e.name)) continue;
     const full = path.join(dir, e.name);
     if (e.isDirectory()) {
-      await walk(full, acc, depth + 1);
+      await walk(full, acc, depth + 1, basePath);
     } else if (e.isFile()) {
       const ext = path.extname(e.name);
       try {
@@ -87,7 +84,7 @@ async function walk(dir: string, acc: FileEntry[], depth = 0): Promise<void> {
           const content = await readFile(full, "utf-8");
           lines = content.split("\n").length;
         }
-        acc.push({ rel: path.relative(ROOT, full), ext, bytes: s.size, lines });
+        acc.push({ rel: path.relative(basePath, full), ext, bytes: s.size, lines });
       } catch {
         /* unreadable file — skipped, reported as warning by caller */
       }
@@ -96,14 +93,18 @@ async function walk(dir: string, acc: FileEntry[], depth = 0): Promise<void> {
 }
 
 /* ---------------- 1. filesystem + repo inventory ---------------- */
-export async function scanFilesystem(): Promise<ScanResult> {
+export async function scanFilesystem(target?: AuditTarget): Promise<ScanResult> {
   const scan = startScan("filesystem-inventory");
   try {
-    const target = targetLooksValid();
-    if (!target.valid) return scan.fail(target.reason);
+    const root = target?.root ?? LEGACY_ROOT;
+    if (target && !target.rootValid) return scan.fail(target.rootInvalidReason ?? `invalid target root: ${root}`);
+    if (!target) {
+      const check = targetLooksValid();
+      if (!check.valid) return scan.fail(check.reason);
+    }
 
     const files: FileEntry[] = [];
-    await walk(ROOT, files);
+    await walk(root, files, 0, root);
 
     const byExt: Record<string, { files: number; lines: number; bytes: number }> = {};
     for (const f of files) {
@@ -114,7 +115,7 @@ export async function scanFilesystem(): Promise<ScanResult> {
       byExt[key].bytes += f.bytes;
     }
 
-    const topLevel = (await readdir(ROOT, { withFileTypes: true }))
+    const topLevel = (await readdir(root, { withFileTypes: true }))
       .filter((e) => !e.name.startsWith(".") || e.name === ".github")
       .filter((e) => !SKIP_DIRS.has(e.name))
       .map((e) => `${e.isDirectory() ? "dir " : "file"} /${e.name}`)
@@ -130,26 +131,26 @@ export async function scanFilesystem(): Promise<ScanResult> {
       "Dockerfile",
       ".env.example",
       "README.md",
-    ].filter((f) => existsSync(path.join(ROOT, f)));
+    ].filter((f) => existsSync(path.join(root, f)));
 
     for (const required of ["README.md", ".env.example", "Dockerfile", "docker-compose.yml"]) {
       if (!configFiles.includes(required)) warnings.push(`missing ${required}`);
     }
-    if (!existsSync(path.join(ROOT, "package-lock.json"))) {
+    if (!existsSync(path.join(root, "package-lock.json"))) {
       warnings.push("package-lock.json missing — npm ci will fail in CI/Docker");
     }
 
     const totalLines = files.reduce((a, f) => a + f.lines, 0);
     return scan.ok(
       {
-        targetRoot: ROOT,
+        targetRoot: root,
         totalFiles: files.length,
         totalLines,
         totalBytes: files.reduce((a, f) => a + f.bytes, 0),
         byExtension: byExt,
         topLevel,
         configFiles,
-        lockFilePresent: existsSync(path.join(ROOT, "package-lock.json")),
+        lockFilePresent: existsSync(path.join(root, "package-lock.json")),
         largestFiles: [...files].sort((a, b) => b.lines - a.lines).slice(0, 8).map((f) => ({ path: f.rel, lines: f.lines })),
       },
       ["raw/host_inventory.json", "raw/repo_inventory.json"],
@@ -161,10 +162,11 @@ export async function scanFilesystem(): Promise<ScanResult> {
 }
 
 /* ---------------- 2. package / SBOM inventory ---------------- */
-export async function scanPackages(): Promise<ScanResult> {
+export async function scanPackages(target?: AuditTarget): Promise<ScanResult> {
   const scan = startScan("package-inventory");
   try {
-    const pkgRaw = await readFile(path.join(ROOT, "package.json"), "utf-8");
+    const root = target?.root ?? LEGACY_ROOT;
+    const pkgRaw = await readFile(path.join(root, "package.json"), "utf-8");
     const pkg = JSON.parse(pkgRaw) as {
       name?: string;
       dependencies?: Record<string, string>;
@@ -177,7 +179,7 @@ export async function scanPackages(): Promise<ScanResult> {
     const warnings: string[] = [];
 
     for (const [name, range] of Object.entries(declared)) {
-      const modPath = path.join(ROOT, "node_modules", name, "package.json");
+      const modPath = path.join(root, "node_modules", name, "package.json");
       let version = range;
       let license = "UNKNOWN";
       try {
@@ -205,7 +207,7 @@ export async function scanPackages(): Promise<ScanResult> {
     /* ---- transitive dependencies: walk node_modules for installed pkgs ---- */
     const seen = new Set(components.map((c) => c.name));
     const transitiveComponents: typeof components = [];
-    const topModulesDir = path.join(ROOT, "node_modules");
+    const topModulesDir = path.join(root, "node_modules");
     try {
       const walkScopes = async (base: string) => {
         const entries = await readdir(base, { withFileTypes: true }).catch(() => []);
@@ -331,15 +333,16 @@ function refineSeverity(
 
 const SECRET_ALLOWLIST = [/\.env\.example$/, /README\.md$/, /scanners\.ts$/, /seed\.ts$/, /tests\//];
 
-export async function scanSecrets(): Promise<ScanResult> {
+export async function scanSecrets(target?: AuditTarget): Promise<ScanResult> {
   const scan = startScan("secret-scan");
   try {
+    const root = target?.root ?? LEGACY_ROOT;
     const files: FileEntry[] = [];
-    await walk(path.join(ROOT, "src"), files);
+    await walk(path.join(root, "src"), files, 0, root);
     const extra = [".env", ".env.local", "docker-compose.yml", "Dockerfile"]
-      .map((f) => path.join(ROOT, f))
+      .map((f) => path.join(root, f))
       .filter((f) => existsSync(f))
-      .map((f) => ({ rel: path.relative(ROOT, f), ext: path.extname(f), bytes: 0, lines: 0 }));
+      .map((f) => ({ rel: path.relative(root, f), ext: path.extname(f), bytes: 0, lines: 0 }));
 
     const hits: Array<{
       rule: string;
@@ -358,7 +361,7 @@ export async function scanSecrets(): Promise<ScanResult> {
       }
       let content: string;
       try {
-        content = await readFile(path.join(ROOT, f.rel), "utf-8");
+        content = await readFile(path.join(root, f.rel), "utf-8");
       } catch {
         continue;
       }
@@ -401,63 +404,125 @@ export async function scanSecrets(): Promise<ScanResult> {
 }
 
 /* ---------------- 4. database schema (SELECT-only) ---------------- */
-export async function scanDatabase(): Promise<ScanResult> {
+export async function scanDatabase(target?: AuditTarget): Promise<ScanResult> {
   const scan = startScan("database-inventory");
   try {
-    const db = getDb();
+    /* Fail-closed: if no target DB URL is configured, SKIP the DB scanner
+       entirely — do NOT fall back to the control plane's own DATABASE_URL.
+       Scanning the auditor's own DB would produce a false-green (the
+       auditor's DB is always healthy because the auditor is running).
+       The scanner returns a "skipped" result with a clear reason so the
+       report shows "DB not configured" instead of misleading green. */
+    const targetDbUrl = target?.databaseUrl ?? null;
+    if (target && !databaseScopeEnabled(target)) {
+      return scan.ok(
+        {
+          targetDatabase: null,
+          skipped: true,
+          reason: "no TARGET_DATABASE_URL configured for this environment — DB scanner skipped (fail-closed, not scanning control plane's own DB)",
+          tableCount: 0,
+          tables: [],
+          indexCount: 0,
+          indexes: [],
+          missingIndexes: [],
+        },
+        ["raw/database_inventory.json"],
+        ["DB scanner skipped: no target database configured for this environment"],
+      );
+    }
+    if (!target && !process.env.TARGET_DATABASE_URL) {
+      /* Legacy call path (no target) — also fail-closed, don't use control plane DB */
+      return scan.ok(
+        {
+          targetDatabase: null,
+          skipped: true,
+          reason: "no TARGET_DATABASE_URL configured — DB scanner skipped (fail-closed)",
+          tableCount: 0,
+          tables: [],
+          indexCount: 0,
+          indexes: [],
+          missingIndexes: [],
+        },
+        ["raw/database_inventory.json"],
+        ["DB scanner skipped: no target database configured"],
+      );
+    }
 
-    const tables = (await db.execute(
-      sql`select table_name, (select count(*) from information_schema.columns c
-            where c.table_name = t.table_name and c.table_schema='public') as columns
-          from information_schema.tables t
-          where t.table_schema='public' and t.table_type='BASE TABLE'
-          order by table_name`,
-    )) as unknown as { rows: Array<{ table_name: string; columns: string }> };
+    const dbUrl = targetDbUrl ?? process.env.TARGET_DATABASE_URL!;
+    const pool = new Pool({
+      connectionString: dbUrl,
+      max: 2,
+      connectionTimeoutMillis: 5_000,
+    });
 
-    const indexes = (await db.execute(
-      sql`select tablename, indexname, indexdef from pg_indexes
-          where schemaname='public' order by tablename, indexname`,
-    )) as unknown as { rows: Array<{ tablename: string; indexname: string; indexdef: string }> };
+    try {
+      const query = async <T>(text: string): Promise<{ rows: T[] }> => {
+        return (await pool.query(text)) as unknown as { rows: T[] };
+      };
 
-    /* columns that look like hot filter/sort paths but have no index */
-    const candidates = (await db.execute(
-      sql`select table_name, column_name from information_schema.columns
-          where table_schema='public'
-            and (column_name in ('created_at','ts','audit_id','status','severity','metric','expires_at'))
-          order by table_name, column_name`,
-    )) as unknown as { rows: Array<{ table_name: string; column_name: string }> };
+      const tables = await query<{ table_name: string; columns: string }>(
+        `select table_name, (select count(*) from information_schema.columns c
+           where c.table_name = t.table_name and c.table_schema='public') as columns
+         from information_schema.tables t
+         where t.table_schema='public' and t.table_type='BASE TABLE'
+         order by table_name`,
+      );
 
-    const indexRows = indexes.rows ?? [];
-    const missingIndexes = (candidates.rows ?? []).filter(
-      (c) =>
-        !indexRows.some(
-          (i) => i.tablename === c.table_name && i.indexdef.toLowerCase().includes(`(${c.column_name}`),
-        ),
-    );
+      const indexes = await query<{ tablename: string; indexname: string; indexdef: string }>(
+        `select tablename, indexname, indexdef from pg_indexes
+         where schemaname='public' order by tablename, indexname`,
+      );
 
-    return scan.ok(
-      {
-        tableCount: (tables.rows ?? []).length,
-        tables: (tables.rows ?? []).map((r) => ({ table: r.table_name, columns: Number(r.columns), rows: null })),
-        indexCount: indexRows.length,
-        indexes: indexRows.map((r) => ({ table: r.tablename, index: r.indexname, definition: r.indexdef })),
-        missingIndexes: missingIndexes.map((r) => ({ table: r.table_name, column: r.column_name })),
-      },
-      ["raw/database_inventory.json"],
-      missingIndexes.length ? [`${missingIndexes.length} hot column(s) without an index`] : [],
-    );
+      /* columns that look like hot filter/sort paths but have no index */
+      const candidates = await query<{ table_name: string; column_name: string }>(
+        `select table_name, column_name from information_schema.columns
+         where table_schema='public'
+           and (column_name in ('created_at','ts','audit_id','status','severity','metric','expires_at'))
+         order by table_name, column_name`,
+      );
+
+      const indexRows = indexes.rows ?? [];
+      const missingIndexes = (candidates.rows ?? []).filter(
+        (c) =>
+          !indexRows.some(
+            (i) => i.tablename === c.table_name && i.indexdef.toLowerCase().includes(`(${c.column_name}`),
+          ),
+      );
+
+      const warnings: string[] = [];
+      if (missingIndexes.length) warnings.push(`${missingIndexes.length} hot column(s) without an index`);
+
+      return scan.ok(
+        {
+          targetDatabase: "[redacted]",
+          skipped: false,
+          tableCount: (tables.rows ?? []).length,
+          tables: (tables.rows ?? []).map((r) => ({ table: r.table_name, columns: Number(r.columns), rows: null })),
+          indexCount: indexRows.length,
+          indexes: indexRows.map((r) => ({ table: r.tablename, index: r.indexname, definition: r.indexdef })),
+          missingIndexes: missingIndexes.map((r) => ({ table: r.table_name, column: r.column_name })),
+        },
+        ["raw/database_inventory.json"],
+        warnings,
+      );
+    } finally {
+      await pool.end();
+    }
   } catch (err) {
     return scan.fail(err);
   }
 }
 
 /* ---------------- 5. runtime + env contract ---------------- */
-export async function scanRuntime(): Promise<ScanResult> {
+export async function scanRuntime(target?: AuditTarget): Promise<ScanResult> {
   const scan = startScan("runtime-inventory");
   try {
+    const root = target?.root ?? LEGACY_ROOT;
+    const runtimeEndpoint = target?.runtimeEndpoint ?? null;
+
     let declared: string[] = [];
     try {
-      const example = await readFile(path.join(ROOT, ".env.example"), "utf-8");
+      const example = await readFile(path.join(root, ".env.example"), "utf-8");
       declared = example
         .split("\n")
         .map((l) => l.trim())
@@ -478,6 +543,35 @@ export async function scanRuntime(): Promise<ScanResult> {
     });
     if (insecureDefaults.length) warnings.push(`${insecureDefaults.length} env var(s) still hold placeholder values`);
 
+    /* Probe the target runtime endpoint if configured. Without this, the
+       runtime scanner only measures the auditor's own worker process —
+       a false-green for the target system's health. */
+    let remoteHealth: { ok: boolean; statusCode: number; latencyMs: number; body: string } | null = null;
+    if (runtimeEndpoint) {
+      try {
+        const t0 = Date.now();
+        const resp = await fetch(runtimeEndpoint, { signal: AbortSignal.timeout(5000) });
+        const body = await resp.text();
+        remoteHealth = {
+          ok: resp.ok,
+          statusCode: resp.status,
+          latencyMs: Date.now() - t0,
+          body: body.slice(0, 500),
+        };
+        if (!resp.ok) warnings.push(`target runtime endpoint returned ${resp.status}`);
+      } catch (err) {
+        remoteHealth = {
+          ok: false,
+          statusCode: 0,
+          latencyMs: 0,
+          body: err instanceof Error ? err.message : String(err),
+        };
+        warnings.push(`target runtime endpoint unreachable: ${remoteHealth.body}`);
+      }
+    } else {
+      warnings.push("no TARGET_RUNTIME_ENDPOINT configured — measured worker process only, not target system");
+    }
+
     return scan.ok(
       {
         node: process.version,
@@ -488,6 +582,8 @@ export async function scanRuntime(): Promise<ScanResult> {
         appMode: process.env.APP_MODE ?? "demo",
         nodeEnv: process.env.NODE_ENV ?? "development",
         env: { declared, present, missing, undeclared: [], insecureDefaults },
+        runtimeEndpoint,
+        remoteHealth,
       },
       ["raw/host_inventory.json", "raw/env_matrix.json"],
       warnings,
@@ -498,14 +594,18 @@ export async function scanRuntime(): Promise<ScanResult> {
 }
 
 /* ---------------- 6. API route / service catalog ---------------- */
-export async function scanRoutes(): Promise<ScanResult> {
+export async function scanRoutes(target?: AuditTarget): Promise<ScanResult> {
   const scan = startScan("route-inventory");
   try {
-    const target = targetLooksValid();
-    if (!target.valid) return scan.fail(target.reason);
-    const apiRoot = path.join(ROOT, "src", "app", "api");
+    const root = target?.root ?? LEGACY_ROOT;
+    if (target && !target.rootValid) return scan.fail(target.rootInvalidReason ?? `invalid target root: ${root}`);
+    if (!target) {
+      const check = targetLooksValid();
+      if (!check.valid) return scan.fail(check.reason);
+    }
+    const apiRoot = path.join(root, "src", "app", "api");
     if (!existsSync(apiRoot)) {
-      return scan.fail(`no src/app/api under ${ROOT} — source tree not available to the auditor`);
+      return scan.fail(`no src/app/api under ${root} — source tree not available to the auditor`);
     }
     const routes: Array<{
       route: string;
@@ -553,7 +653,7 @@ export async function scanRoutes(): Promise<ScanResult> {
     }
     await walkRoutes(apiRoot, "");
 
-    const pageRoot = path.join(ROOT, "src", "app");
+    const pageRoot = path.join(root, "src", "app");
     const pages: string[] = [];
     for (const e of await readdir(pageRoot, { withFileTypes: true })) {
       if (e.isDirectory() && e.name !== "api" && existsSync(path.join(pageRoot, e.name, "page.tsx"))) {
@@ -579,6 +679,19 @@ export async function scanRoutes(): Promise<ScanResult> {
   }
 }
 
+/** Each scanner is tagged with its scope so the engine can filter by the
+ *  audit request's `scope` field. A scanner whose scope is NOT in the
+ *  target's scope list is skipped — e.g. an audit scoped to ["filesystem",
+ *  "packages"] won't touch the database. */
+export const SCANNER_SCOPES: Record<string, Scope> = {
+  "filesystem-inventory": "filesystem",
+  "package-inventory": "packages",
+  "secret-scan": "secrets",
+  "database-inventory": "database",
+  "runtime-inventory": "runtime",
+  "route-inventory": "routes",
+};
+
 export const DISCOVERY_SCANNERS = [
   scanFilesystem,
   scanPackages,
@@ -587,3 +700,36 @@ export const DISCOVERY_SCANNERS = [
   scanRuntime,
   scanRoutes,
 ] as const;
+
+/** Run only the scanners whose scope is enabled for the target. Returns
+ *  [scanner, scope] pairs so the caller can log which scanner ran.
+ *
+ *  DB scanner is additionally gated by `databaseScopeEnabled` — if no
+ *  target DB URL is configured, the DB scanner is skipped entirely
+ *  (fail-closed) instead of falling back to the control plane's own DB. */
+export function scannersForTarget(target: AuditTarget): Array<{
+  name: string;
+  scope: Scope;
+  run: () => Promise<ScanResult>;
+}> {
+  const all: Array<{ name: string; run: (t?: AuditTarget) => Promise<ScanResult> }> = [
+    { name: "filesystem-inventory", run: scanFilesystem },
+    { name: "package-inventory", run: scanPackages },
+    { name: "secret-scan", run: scanSecrets },
+    { name: "database-inventory", run: scanDatabase },
+    { name: "runtime-inventory", run: scanRuntime },
+    { name: "route-inventory", run: scanRoutes },
+  ];
+  return all
+    .filter((s) => {
+      if (!scopeEnabled(target, SCANNER_SCOPES[s.name])) return false;
+      /* DB scanner: fail-closed — skip if no target DB URL */
+      if (s.name === "database-inventory" && !databaseScopeEnabled(target)) return false;
+      return true;
+    })
+    .map((s) => ({
+      name: s.name,
+      scope: SCANNER_SCOPES[s.name],
+      run: () => s.run(target),
+    }));
+}

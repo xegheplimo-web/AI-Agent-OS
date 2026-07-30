@@ -4,10 +4,14 @@ import { parityReports } from "@/db/schema";
 import { advanceIfDemo } from "@/services/audit";
 import { parityReportDtoSchema, type ParityReportDTO, type ParityCheckDTO } from "@/lib/contracts";
 import { diffParityChecks } from "@/lib/parity";
+import { requirePermission } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(req: Request) {
+  const auth = await requirePermission(req, "system:read");
+  if (auth instanceof Response) return auth;
+
   await advanceIfDemo();
 
   const rows = await db.select().from(parityReports).orderBy(desc(parityReports.createdAt)).limit(8);

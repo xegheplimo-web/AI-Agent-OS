@@ -174,7 +174,11 @@ export function normalize(results: ScanResult[]): NormalizedInventory {
 /* ------------------------------------------------------------------ */
 /* Parity checks computed from the real inventory                      */
 /* ------------------------------------------------------------------ */
-export function parityChecksFrom(inv: NormalizedInventory, latencyP95: number | null) {
+export function parityChecksFrom(
+  inv: NormalizedInventory,
+  latencyP95: number | null,
+  scanResults?: ScanResult[],
+) {
   const routeCount = inv.services.length;
   const guarded = inv.services.filter((s) => (s as { guarded?: boolean }).guarded).length;
   const mutating = inv.services.filter((s) => {
@@ -185,6 +189,14 @@ export function parityChecksFrom(inv: NormalizedInventory, latencyP95: number | 
     const methods = (s as { methods?: string[] }).methods ?? [];
     return methods.some((m) => m !== "GET") && !(s as { guarded?: boolean }).guarded;
   }).length;
+
+  /* DB measurement evidence: the database-inventory scanner must have run
+     AND not failed. When the scanner was skipped (no TARGET_DATABASE_URL) or
+     failed, there is no evidence about the target DB, so db_schema must NOT
+     read "passed" — that would be a false-green (an unmeasured DB reported
+     as healthy). Fail-closed: no evidence => pending. */
+  const dbScan = scanResults?.find((r) => r.scanner === "database-inventory");
+  const dbMeasured = !!dbScan && dbScan.status !== "failed";
 
   return [
     {
@@ -233,12 +245,23 @@ export function parityChecksFrom(inv: NormalizedInventory, latencyP95: number | 
     {
       key: "db_schema",
       label: "DB schema & migration state",
-      baselineValue: `${inv.schema.tables.length} tables`,
-      currentValue: `${inv.schema.indexes.length} indexes`,
-      status: (inv.schema.missingIndexes.length === 0 ? "passed" : "warning") as "passed" | "warning",
-      ...(inv.schema.missingIndexes.length
-        ? { difference: `${inv.schema.missingIndexes.length} missing indexes` }
-        : {}),
+      baselineValue: dbMeasured ? `${inv.schema.tables.length} tables` : "not measured",
+      currentValue: dbMeasured ? `${inv.schema.indexes.length} indexes` : "not measured",
+      /* Fail-closed: when the DB scanner was skipped or failed there is no
+         evidence about the target database, so this check must be "pending"
+         — never "passed". Previously an absent DB scanner left
+         missingIndexes empty and this read "passed", a false-green where an
+         unmeasured DB was reported healthy. */
+      status: (!dbMeasured
+        ? "pending"
+        : inv.schema.missingIndexes.length === 0
+          ? "passed"
+          : "warning") as "passed" | "warning" | "pending",
+      ...(!dbMeasured
+        ? { difference: "database-inventory scanner skipped or failed — no DB evidence" }
+        : inv.schema.missingIndexes.length
+          ? { difference: `${inv.schema.missingIndexes.length} missing indexes` }
+          : {}),
     },
     {
       key: "ui_critical_paths",

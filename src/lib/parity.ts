@@ -15,7 +15,11 @@ export interface ParityCheckResult extends ParityCheckBase {
 export function computeParityScore(
   checks: Array<{ status: "passed" | "failed" | "warning" | "pending" }>,
 ): { score: number; overallStatus: "passed" | "warning" | "failed" } {
-  if (checks.length === 0) return { score: 100, overallStatus: "passed" };
+  /* Fail-closed: zero checks means nothing was measured, not that everything
+     passed. Returning 100/passed here was a false-green — a system with no
+     scanner output would display a perfect parity score. Instead, return
+     0/failed so the UI shows "no data" rather than "all green". */
+  if (checks.length === 0) return { score: 0, overallStatus: "failed" };
   const failed = checks.filter((c) => c.status === "failed").length;
   const warnings = checks.filter((c) => c.status === "warning").length;
   const pending = checks.filter((c) => c.status === "pending").length;

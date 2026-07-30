@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { approvals, artifacts, audits, events, findings, jobs, parityReports, telemetryPoints } from "@/db/schema";
 import { computeParityScore } from "@/lib/parity";
 import { logAudit } from "@/lib/audit-log";
 import { GENERATOR_VERSION } from "@/lib/version";
-import { DISCOVERY_SCANNERS } from "@/services/auditor/scanners";
+import { LeaseLostError } from "@/services/lease";
+import { scannersForTarget } from "@/services/auditor/scanners";
 import { normalize, parityChecksFrom } from "@/services/auditor/normalize";
+import { resolveTarget, targetProvenance, type AuditTarget } from "@/services/auditor/target";
 import {
   buildInventoryJson,
   buildRealArchitectureMmd,
@@ -66,18 +68,83 @@ async function setStages(auditId: string, stages: StageRow[]) {
   await db.update(audits).set({ stages }).where(eq(audits.id, auditId));
 }
 
-/** Keeps the owning job alive so stale-recovery does not steal a live audit. */
-async function heartbeat(jobId?: string) {
+/** Error thrown when a lease-fenced update matches 0 rows — the worker lost
+ *  ownership of the job (stale supervisor requeued it, another worker claimed
+ *  it). The caller must abort all further writes and exit silently. */
+// LeaseLostError is imported from @/services/lease so the audit engine and
+// the non-audit executors share one error class (instanceof works across
+// modules).
+
+/** Keeps the owning job alive so stale-recovery does not steal a live audit.
+ *
+ *  Lease fencing: the update only matches if lease_token still equals the
+ *  token this worker was given at claim time. If a stale supervisor requeued
+ *  the job (clearing lease_token) and another worker claimed it, this update
+ *  matches 0 rows — the worker lost ownership and must not continue writing.
+ *
+ *  Uses RETURNING to detect the 0-row case and throws LeaseLostError so the
+ *  caller can abort immediately instead of continuing to write stale data. */
+async function heartbeat(jobId?: string, leaseToken?: string | null): Promise<void> {
   if (!jobId) return;
-  await db.update(jobs).set({ heartbeatAt: new Date(), updatedAt: new Date() }).where(eq(jobs.id, jobId));
+  const filter = leaseToken ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken)) : eq(jobs.id, jobId);
+  const updated = await db
+    .update(jobs)
+    .set({ heartbeatAt: new Date(), updatedAt: new Date() })
+    .where(filter)
+    .returning({ id: jobs.id });
+  if (leaseToken && !updated.length) throw new LeaseLostError();
 }
 
-async function setJobProgress(jobId: string | undefined, progress: number) {
+async function setJobProgress(jobId: string | undefined, progress: number, leaseToken?: string | null): Promise<void> {
   if (!jobId) return;
-  await db
+  const filter = leaseToken ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken)) : eq(jobs.id, jobId);
+  const updated = await db
     .update(jobs)
     .set({ progress, heartbeatAt: new Date(), updatedAt: new Date() })
-    .where(eq(jobs.id, jobId));
+    .where(filter)
+    .returning({ id: jobs.id });
+  if (leaseToken && !updated.length) throw new LeaseLostError();
+}
+
+/** Starts a background heartbeat timer that fires every 15s while the audit
+ *  pipeline runs. Without this, a scanner or executor that takes longer than
+ *  the stale-recovery threshold (45s) would have its job requeued even though
+ *  the worker is still alive and making progress.
+ *
+ *  Returns a stop function — call it when the pipeline finishes (success or
+ *  failure) to clear the interval. If a heartbeat detects lease loss, it
+ *  sets a flag that the next `assertLease()` check will see. */
+function startHeartbeatLoop(jobId: string | undefined, leaseToken: string | null | undefined): {
+  stop: () => void;
+  leaseLost: () => boolean;
+} {
+  let lost = false;
+  if (!jobId || !leaseToken) return { stop: () => {}, leaseLost: () => false };
+  const timer = setInterval(async () => {
+    try {
+      await heartbeat(jobId, leaseToken);
+    } catch (err) {
+      if (err instanceof LeaseLostError) {
+        lost = true;
+      }
+    }
+  }, 15_000);
+  return {
+    stop: () => clearInterval(timer),
+    leaseLost: () => lost,
+  };
+}
+
+/** Throws LeaseLostError if the background heartbeat detected lease loss or
+ *  if an explicit lease check fails. Call this before each major side-effect
+ *  group (scanner results, findings, reconstruction artifacts, finalize). */
+async function assertLease(jobId: string | undefined, leaseToken: string | null | undefined, heartbeatState: { leaseLost: () => boolean }): Promise<void> {
+  if (!jobId || !leaseToken) return;
+  if (heartbeatState.leaseLost()) throw new LeaseLostError();
+  /* Explicit DB check: even if the background timer hasn't fired yet, the
+     lease may have been cleared by a concurrent requeue. */
+  const rows = await db.select({ leaseToken: jobs.leaseToken }).from(jobs).where(eq(jobs.id, jobId)).limit(1);
+  if (!rows.length || rows[0].leaseToken !== leaseToken) throw new LeaseLostError();
 }
 
 async function persistArtifact(params: {
@@ -150,19 +217,34 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
   if (audit.status !== "running") return;
 
   const environment = audit.environment;
+  const target = resolveTarget(environment, audit.scope ?? []);
   const stages = initialStages();
   const t0 = Date.now();
 
+  /* Background heartbeat: fires every 15s so a long-running scanner or
+     executor doesn't get requeued by stale recovery (threshold 45s). */
+  const hb = startHeartbeatLoop(jobId, leaseToken);
+
   try {
     /* ---------------- Stage 1: Discovery ---------------- */
+    /* Assert the lease BEFORE the first side effect: previously setStages
+       and the first raw artifact were written before any lease check, so a
+       worker that had already lost ownership would still mutate the audit's
+       stage state. The heartbeat loop may not have fired yet, so this explicit
+       DB check catches a concurrent requeue immediately. */
+    await assertLease(jobId, leaseToken, hb);
     stages[0].status = "active";
     stages[0].startedAt = new Date().toISOString();
     await setStages(auditId, stages);
-    await setJobProgress(jobId, 5);
+    await setJobProgress(jobId, 5, leaseToken);
 
+    /* Target-aware scanning: only run scanners whose scope is in the audit
+       request's scope list. Each scanner receives the resolved target so it
+       reads from the target root / target DB, not the control plane's own. */
+    const scanners = scannersForTarget(target);
     const results: ScanResult[] = [];
-    for (const scanner of DISCOVERY_SCANNERS) {
-      const res = await scanner();
+    for (const { name, run } of scanners) {
+      const res = await run();
       results.push(res);
       stages[0].artifacts = Array.from(new Set(results.flatMap((r) => r.artifacts)));
       await setStages(auditId, stages);
@@ -179,10 +261,16 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
         content: buildInventoryJson(`${res.scanner}.json`, res),
         tags: ["discovery", "raw", res.scanner],
         environment,
-        metadata: { stage: "discovery", scanner: res.scanner, status: res.status, audit: audit.name },
+        metadata: {
+          stage: "discovery",
+          scanner: res.scanner,
+          status: res.status,
+          audit: audit.name,
+          provenance: targetProvenance(target),
+        },
       });
 
-      await setJobProgress(jobId, 5 + Math.round((results.length / DISCOVERY_SCANNERS.length) * 40));
+      await setJobProgress(jobId, 5 + Math.round((results.length / scanners.length) * 40), leaseToken);
     }
     stages[0].status = "done";
     stages[0].durationMs = Date.now() - t0;
@@ -197,6 +285,7 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
     });
 
     /* ---------------- Stage 2: Normalization ---------------- */
+    await assertLease(jobId, leaseToken, hb);
     const t1 = Date.now();
     stages[1].status = "active";
     stages[1].startedAt = new Date().toISOString();
@@ -234,6 +323,7 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
     await setStages(auditId, stages);
 
     /* real findings → DB (upsert on fingerprint so retries don't duplicate) */
+    await assertLease(jobId, leaseToken, hb);
     const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
     for (const f of inv.findings) {
       counts[f.severity] += 1;
@@ -256,7 +346,7 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
           set: { severity: f.severity, description: f.description, evidence: f.evidence },
         });
     }
-    await setJobProgress(jobId, 65);
+    await setJobProgress(jobId, 65, leaseToken);
 
     await db.insert(events).values({
       type: "audit.stage.completed",
@@ -266,11 +356,12 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
     });
 
     /* ---------------- Stage 3: Reconstruction ---------------- */
+    await assertLease(jobId, leaseToken, hb);
     const t2 = Date.now();
     stages[2].status = "active";
     stages[2].startedAt = new Date().toISOString();
     await setStages(auditId, stages);
-    await heartbeat(jobId);
+    await heartbeat(jobId, leaseToken);
 
     const p95Rows = await db
       .select()
@@ -283,7 +374,7 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
        is a false-green. null propagates to a `pending` check instead. */
     const latencyP95: number | null = p95Rows.length ? p95Rows[0].value : null;
 
-    const checks = parityChecksFrom(inv, latencyP95);
+    const checks = parityChecksFrom(inv, latencyP95, results);
     const { score: parityScore, overallStatus } = computeParityScore(checks);
 
     const recon = [
@@ -341,6 +432,7 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
     ];
 
     for (const a of recon) {
+      await assertLease(jobId, leaseToken, hb);
       await persistArtifact({
         auditId,
         kind: a.kind,
@@ -359,9 +451,10 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
     stages[2].durationMs = Date.now() - t2;
     stages[2].artifacts = recon.map((a) => a.path.replace("/audit/", ""));
     await setStages(auditId, stages);
-    await setJobProgress(jobId, 92);
+    await setJobProgress(jobId, 92, leaseToken);
 
     /* ---------------- finalize ---------------- */
+    await assertLease(jobId, leaseToken, hb);
     const severityPenalty = counts.critical * 12 + counts.high * 6 + counts.medium * 3 + counts.low * 1;
     const auditScore = Math.max(0, Math.min(100, 100 - severityPenalty));
 
@@ -390,6 +483,7 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
         })
         .onConflictDoUpdate({
           target: [parityReports.auditId],
+          targetWhere: sql`${parityReports.auditId} IS NOT NULL`,
           set: {
             overallStatus,
             score: parityScore,
@@ -435,19 +529,24 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
           .where(leaseFilter)
           .returning({ id: jobs.id });
         if (leaseToken && !finalized.length) {
-          throw new Error("LEASE_LOST: job was requeued by the stale supervisor before this worker could finalize — aborting to avoid duplicate completion");
+          throw new LeaseLostError();
         }
       }
-    });
 
-    await db.insert(approvals).values({
-      actionType: "artifact.package",
-      targetType: "audit",
-      targetId: auditId,
-      title: `Package reconstruction bundle của ${audit.name} (local artifact)`,
-      environment,
-      requestedBy: "auditor-service",
-      payload: { auditId, target: "audit/recon/bundle.tar.zst" },
+      /* The artifact.package approval is created INSIDE the finalize
+         transaction so the audit cannot end up "completed" with no packaging
+         approval (or vice versa) if one write succeeds and the other fails.
+         Previously this insert ran after the transaction committed, leaving a
+         window where a crash orphaned the approval or the completed audit. */
+      await tx.insert(approvals).values({
+        actionType: "artifact.package",
+        targetType: "audit",
+        targetId: auditId,
+        title: `Package reconstruction bundle của ${audit.name} (local artifact)`,
+        environment,
+        requestedBy: "auditor-service",
+        payload: { auditId, target: "audit/recon/bundle.tar.zst" },
+      });
     });
 
     await logAudit({
@@ -458,6 +557,16 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
       detail: { engine: "real", score: auditScore, parityScore, findings: counts, scanners: results.length },
     });
   } catch (err) {
+    hb.stop();
+
+    /* LEASE_LOST is silent: the worker lost ownership of the job (stale
+       supervisor requeued it, another worker claimed it). The new owner
+       will handle the audit. This worker must NOT touch audit/job/event
+       state — doing so would corrupt the new owner's run. */
+    if (err instanceof LeaseLostError) {
+      return;
+    }
+
     const message = err instanceof Error ? err.message : String(err);
     const idx = stages.findIndex((s) => s.status === "active");
     if (idx >= 0) stages[idx].status = "failed";
@@ -521,6 +630,8 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
       result: "error",
       detail: { error: message, jobId },
     });
+  } finally {
+    hb.stop();
   }
 }
 
