@@ -267,5 +267,20 @@ export function getPermissionsForRole(role: Role): Permission[] {
 }
 
 export function clientIp(req: Request): string | null {
-  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? req.headers.get("x-real-ip");
+  /* Only trust x-forwarded-for / x-real-ip when a trusted proxy is
+     configured. Without this, a client can spoof its IP via the header
+     and bypass rate limiting. TRUSTED_PROXY_CIDR is a comma-separated
+     list of CIDR ranges (e.g. "10.0.0.0/8,172.16.0.0/12"). When unset,
+     we fall back to the socket peer IP (x-real-ip set by the reverse
+     proxy) or "unknown" — never the client-supplied x-forwarded-for. */
+  const trustedProxy = process.env.TRUSTED_PROXY_CIDR;
+  const xff = req.headers.get("x-forwarded-for");
+  const xRealIp = req.headers.get("x-real-ip");
+  if (trustedProxy && xff) {
+    /* Trusted proxy: take the leftmost (original client) IP. */
+    return xff.split(",")[0]?.trim() ?? null;
+  }
+  /* No trusted proxy configured: x-real-ip is set by our own reverse
+     proxy (nginx/Caddy) from the actual socket, not client-supplied. */
+  return xRealIp ?? null;
 }

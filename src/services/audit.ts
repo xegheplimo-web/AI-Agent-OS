@@ -482,10 +482,23 @@ export async function cancelAudit(
         .set({ status: "expired", decidedAt: new Date(), reason: `audit cancelled by ${actor.displayName}` })
         .where(and(eq(approvals.targetId, auditId), eq(approvals.status, "pending")));
 
-      /* Requeue or cancel the active job so the worker doesn't keep running. */
+      /* Revoke the lease AND cancel the active job so the worker cannot
+         continue. Clearing lease_token + locked_by + worker means any
+         in-flight fencedJobUpdate or assert() by the old worker will see
+         0 matching rows → LeaseLostError → abort. Without this, the worker
+         keeps its lease token and can still write artifacts/findings even
+         though the job is 'cancelled'. */
       await tx
         .update(jobs)
-        .set({ status: "cancelled", finishedAt: new Date(), errorCode: "AUDIT_CANCELLED", errorMessage: "audit cancelled by operator" })
+        .set({
+          status: "cancelled",
+          finishedAt: new Date(),
+          errorCode: "AUDIT_CANCELLED",
+          errorMessage: "audit cancelled by operator",
+          leaseToken: null,
+          lockedBy: null,
+          worker: null,
+        })
         .where(and(eq(jobs.auditId, auditId), inArray(jobs.status, ["queued", "running"])));
 
       await tx.insert(events).values({
@@ -658,6 +671,25 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
         set: { overallStatus, score: parityScore, checks, gates: PARITY_GATES.map((g) => ({ ...g })) },
       });
 
+    /* Parity gate enforcement: if parity failed, mark the audit failed and
+       emit ONLY parity.gate.failed — no audit.completed success event.
+       Previously the engine emitted audit.completed (success) and THEN
+       flipped the audit to failed, making the event feed self-contradictory. */
+    if (overallStatus === "failed") {
+      await tx.insert(events).values({
+        type: "parity.gate.failed",
+        severity: "error",
+        source: "auditor",
+        message: `${audit?.name ?? "Audit"} — parity gate FAILED, packaging approval blocked`,
+      });
+      await tx
+        .update(jobs)
+        .set({ status: "failed", progress: 100, finishedAt: new Date(), updatedAt: new Date(), errorCode: "PARITY_GATE_FAILED", errorMessage: "parity gate failed — packaging blocked" })
+        .where(and(eq(jobs.type, "audit.run"), eq(jobs.auditId, auditId)));
+      return;
+    }
+
+    /* Only emit audit.completed when parity is passed or warning. */
     await tx.insert(events).values([
       {
         type: "audit.completed",
@@ -672,22 +704,6 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
         message: `Parity gate ${overallStatus}: ${checks.filter((c) => c.status === "passed").length}/${checks.length} checks green`,
       },
     ]);
-
-    /* Parity gate enforcement: if parity failed, block packaging approval
-       and mark the audit failed — same as the real engine. */
-    if (overallStatus === "failed") {
-      await tx.insert(events).values({
-        type: "parity.gate.failed",
-        severity: "error",
-        source: "auditor",
-        message: `${audit?.name ?? "Audit"} — parity gate FAILED, packaging approval blocked`,
-      });
-      await tx
-        .update(jobs)
-        .set({ status: "failed", progress: 100, finishedAt: new Date(), updatedAt: new Date(), errorCode: "PARITY_GATE_FAILED", errorMessage: "parity gate failed — packaging blocked" })
-        .where(and(eq(jobs.type, "audit.run"), eq(jobs.auditId, auditId)));
-      return;
-    }
 
     /* human-in-the-loop: packaging the reconstruction bundle needs approval.
        Inside the transaction so the demo path matches production — the audit

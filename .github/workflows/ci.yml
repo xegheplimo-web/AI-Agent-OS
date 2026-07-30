@@ -42,9 +42,13 @@ jobs:
 
       - run: npm ci
 
-      # Dependency vulnerability audit — non-blocking (continue-on-error) so
-      # a new advisory doesn't freeze development, but the output is visible
-      # in every CI run so high-severity issues get triaged.
+      # Dependency vulnerability audit. Currently non-blocking because all
+      # 16 high-severity advisories are in `sharp` (inherited from next.js
+      # image optimization) — CVE-2026-33327/33328/35590/35591 in libvips.
+      # `npm audit fix --force` would downgrade next to 9.x (breaking).
+      # The fix is to upgrade sharp to >=0.35.0 via npm overrides once next
+      # supports it. Until then, the audit output is visible in every CI
+      # run for triage. Remove continue-on-error after the override lands.
       - name: Dependency vulnerability audit
         continue-on-error: true
         run: npm audit --audit-level=high
@@ -239,7 +243,17 @@ jobs:
         if: matrix.platform != 'ubuntu-latest'
       - name: Verify tauri.conf.json is valid
         run: npx tauri info
-        continue-on-error: true
       - name: Build Tauri installer (${{ matrix.target }})
         run: npx tauri build --target ${{ matrix.target }}
-        continue-on-error: true # scaffold — not all deps may be available
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-installer-${{ matrix.target }}
+          path: |
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.exe
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.AppImage
+            src-tauri/target/release/bundle/**/*.deb
+          if-no-files-found: warn
+          retention-days: 7

@@ -137,21 +137,46 @@ export async function executeSbomExport(job: JobRow, lease?: LeaseFence): Promis
   const auditName = job.auditId ? (await loadAuditName(job.auditId)) : "global-export";
   const sbom = buildRealSbom(auditName, inv);
 
-  /* Lease fencing: abort before the side effect if we lost ownership of the
-     job while the scanner was running. Without this, a stale worker would
-     still write its SBOM artifact after another worker already took over. */
-  await lease?.assert();
-  await upsertArtifact({
-    auditId: job.auditId ?? null,
-    kind: "sbom",
-    format: "json",
-    mimeType: "application/json",
-    title: `SBOM — CycloneDX 1.6 (${auditName})`,
-    path: job.auditId ? "/audit/exports/sbom.cyclonedx.json" : "/audit/exports/sbom.cyclonedx.json",
-    content: sbom,
-    tags: ["sbom", "supply-chain", "export"],
-    environment,
-    metadata: { job: job.id, jobType: job.type, scanner: "package-inventory" },
+  /* Lease fencing: the artifact write is inside a fencedWrite transaction
+     so the lease check (SELECT FOR UPDATE) and the upsert are atomic —
+     no TOCTOU window between assert() and the write. If the lease is lost
+     (cancel cleared it, or requeue gave the job to another worker), the
+     transaction aborts before the upsert runs. */
+  await lease?.fencedWrite(async (tx) => {
+    await tx
+      .insert(artifacts)
+      .values({
+        auditId: job.auditId ?? null,
+        kind: "sbom",
+        format: "json",
+        title: `SBOM — CycloneDX 1.6 (${auditName})`,
+        path: job.auditId ? "/audit/exports/sbom.cyclonedx.json" : "/audit/exports/sbom.cyclonedx.json",
+        storageProvider: "db",
+        storageKey: job.auditId ? "/audit/exports/sbom.cyclonedx.json" : "/audit/exports/sbom.cyclonedx.json",
+        mimeType: "application/json",
+        sizeBytes: Buffer.byteLength(sbom, "utf-8"),
+        sizeKb: Math.round((Buffer.byteLength(sbom, "utf-8") / 1024) * 10) / 10,
+        sha256: sha256(sbom),
+        schemaVersion: "1.0",
+        generator: "ai-system-auditor",
+        generatorVersion: GENERATOR_VERSION,
+        environment,
+        content: sbom,
+        tags: ["sbom", "supply-chain", "export"],
+        metadata: { job: job.id, jobType: job.type, scanner: "package-inventory" },
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: job.auditId ? [artifacts.auditId, artifacts.path] : [artifacts.path],
+        targetWhere: job.auditId ? undefined : sql`${artifacts.auditId} IS NULL`,
+        set: {
+          content: sbom,
+          sha256: sha256(sbom),
+          sizeBytes: Buffer.byteLength(sbom, "utf-8"),
+          sizeKb: Math.round((Buffer.byteLength(sbom, "utf-8") / 1024) * 10) / 10,
+          updatedAt: new Date(),
+        },
+      });
   });
 }
 
@@ -201,38 +226,60 @@ export async function executeParityGate(job: JobRow, lease?: LeaseFence): Promis
     { key: "lockfile", label: "Deterministic install (lockfile)", status: (inv.repo as { lockFilePresent?: boolean }).lockFilePresent ? "passed" : "failed" },
   ];
 
-  /* Lease fencing before persisting the parity report — a stale worker must
-     not overwrite a report another worker already produced. */
-  await lease?.assert();
-  if (job.auditId) {
-    /* Partial unique index: parity_audit_uidx ON (audit_id) WHERE audit_id IS NOT NULL.
-       Must include targetWhere or PostgreSQL rejects the ON CONFLICT. */
-    await db
-      .insert(parityReports)
-      .values({ auditId: job.auditId, overallStatus, score, environment, checks, gates })
-      .onConflictDoUpdate({
-        target: [parityReports.auditId],
-        targetWhere: sql`${parityReports.auditId} IS NOT NULL`,
-        set: { overallStatus, score, checks, gates, environment },
-      });
-  } else {
-    /* Global parity report (no audit) — no unique constraint, insert as-is. */
-    await db.insert(parityReports).values({ overallStatus, score, environment, checks, gates });
-  }
+  /* Lease fencing: both the parity report upsert and the artifact upsert
+     are inside a fencedWrite transaction. The SELECT FOR UPDATE lease
+     check locks the job row so cancel/requeue cannot clear the lease
+     between check and write. */
+  const parityJson = buildInventoryJson("parity_report.json", { score, overallStatus, checks, gates, latencyP95 });
+  await lease?.fencedWrite(async (tx) => {
+    if (job.auditId) {
+      await tx
+        .insert(parityReports)
+        .values({ auditId: job.auditId, overallStatus, score, environment, checks, gates })
+        .onConflictDoUpdate({
+          target: [parityReports.auditId],
+          targetWhere: sql`${parityReports.auditId} IS NOT NULL`,
+          set: { overallStatus, score, checks, gates, environment },
+        });
+    } else {
+      await tx.insert(parityReports).values({ overallStatus, score, environment, checks, gates });
+    }
 
-  /* Also persist the parity report as a queryable artifact. */
-  await lease?.assert();
-  await upsertArtifact({
-    auditId: job.auditId ?? null,
-    kind: "json",
-    format: "json",
-    mimeType: "application/json",
-    title: "parity_report.json",
-    path: job.auditId ? "/audit/exports/parity_report.json" : "/audit/exports/parity_report.json",
-    content: buildInventoryJson("parity_report.json", { score, overallStatus, checks, gates, latencyP95 }),
-    tags: ["parity", "gate", "export"],
-    environment,
-    metadata: { job: job.id, jobType: job.type, latencySource: latencyP95 === null ? "unavailable" : "telemetry" },
+    /* Persist the parity report as a queryable artifact — same transaction. */
+    await tx
+      .insert(artifacts)
+      .values({
+        auditId: job.auditId ?? null,
+        kind: "json",
+        format: "json",
+        title: "parity_report.json",
+        path: job.auditId ? "/audit/exports/parity_report.json" : "/audit/exports/parity_report.json",
+        storageProvider: "db",
+        storageKey: job.auditId ? "/audit/exports/parity_report.json" : "/audit/exports/parity_report.json",
+        mimeType: "application/json",
+        sizeBytes: Buffer.byteLength(parityJson, "utf-8"),
+        sizeKb: Math.round((Buffer.byteLength(parityJson, "utf-8") / 1024) * 10) / 10,
+        sha256: sha256(parityJson),
+        schemaVersion: "1.0",
+        generator: "ai-system-auditor",
+        generatorVersion: GENERATOR_VERSION,
+        environment,
+        content: parityJson,
+        tags: ["parity", "gate", "export"],
+        metadata: { job: job.id, jobType: job.type, latencySource: latencyP95 === null ? "unavailable" : "telemetry" },
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: job.auditId ? [artifacts.auditId, artifacts.path] : [artifacts.path],
+        targetWhere: job.auditId ? undefined : sql`${artifacts.auditId} IS NULL`,
+        set: {
+          content: parityJson,
+          sha256: sha256(parityJson),
+          sizeBytes: Buffer.byteLength(parityJson, "utf-8"),
+          sizeKb: Math.round((Buffer.byteLength(parityJson, "utf-8") / 1024) * 10) / 10,
+          updatedAt: new Date(),
+        },
+      });
   });
 }
 
@@ -499,15 +546,33 @@ export async function executeKnowledgeReindex(job: JobRow, lease?: LeaseFence): 
 
   /* The merge + persist is wrapped in a transaction with FOR UPDATE on the
      settings row. This serializes concurrent reindex jobs: the second job
-     blocks until the first commits, then reads the updated index. */
+     blocks until the first commits, then reads the updated index.
+
+     Edge case: if the settings row doesn't exist yet (first-ever reindex),
+     SELECT FOR UPDATE locks nothing — two concurrent first-time reindex
+     jobs would both see 0 rows and both insert, causing a lost update.
+     We solve this by inserting a placeholder row first (ON CONFLICT DO
+     NOTHING), so the row always exists before the SELECT FOR UPDATE. The
+     second concurrent insert is a no-op, and both jobs then block on the
+     FOR UPDATE lock. */
   const index = await db.transaction(async (tx) => {
+    /* Ensure the row exists so FOR UPDATE can lock it. ON CONFLICT DO
+       NOTHING means the first inserter wins; the second is a no-op. */
+    await tx.execute(
+      sql`INSERT INTO settings (key, value, updated_at) VALUES ('knowledge.invertedIndex', '{}'::jsonb, NOW()) ON CONFLICT (key) DO NOTHING`,
+    );
+
     if (job.auditId) {
       const existing = await tx.execute(
         sql`SELECT value FROM settings WHERE key = 'knowledge.invertedIndex' FOR UPDATE`,
       );
       const rows_ = (existing.rows ?? []) as Array<{ value: IndexShape }>;
       if (rows_.length) {
-        existingIndex = rows_[0].value;
+        const val = rows_[0].value as IndexShape;
+        /* Don't treat the placeholder '{}' as a real index. */
+        if (val && Object.keys(val).length > 0) {
+          existingIndex = val;
+        }
       }
     }
 

@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { approvals, artifacts, audits, events, findings, jobs, parityReports, telemetryPoints } from "@/db/schema";
 import { computeParityScore } from "@/lib/parity";
 import { logAudit } from "@/lib/audit-log";
 import { GENERATOR_VERSION } from "@/lib/version";
+import { isDemoMode } from "@/services/mode";
 import { LeaseLostError } from "@/services/lease";
 import { scannersForTarget } from "@/services/auditor/scanners";
 import { normalize, parityChecksFrom } from "@/services/auditor/normalize";
@@ -363,10 +364,20 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
     await setStages(auditId, stages);
     await heartbeat(jobId, leaseToken);
 
+    /* p95 latency from telemetry — filtered by source, freshness, and
+       environment so synthetic/manual/stale data cannot make a production
+       parity gate pass. Only "otlp" (or "manual" in demo mode) sources
+       count; data older than 10 minutes is treated as absent. */
+    const FRESHNESS_MS = 10 * 60 * 1000;
+    const cutoff = new Date(Date.now() - FRESHNESS_MS);
     const p95Rows = await db
       .select()
       .from(telemetryPoints)
-      .where(eq(telemetryPoints.metric, "latency_p95"))
+      .where(and(
+        eq(telemetryPoints.metric, "latency_p95"),
+        sql`${telemetryPoints.ts} > ${cutoff}`,
+        inArray(telemetryPoints.source, isDemoMode ? ["synthetic", "manual"] : ["otlp"]),
+      ))
       .orderBy(desc(telemetryPoints.ts))
       .limit(1);
     /* null — not 0 — when there is no telemetry. A 0ms fallback used to make
@@ -465,6 +476,16 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
       { key: "lockfile", label: "Deterministic install (lockfile)", status: (inv.repo as { lockFilePresent?: boolean }).lockFilePresent ? "passed" : "failed" },
     ];
 
+    /* Effective parity status: a failed gate (secrets, lockfile) must
+       escalate the overall status to "failed" even if the check-based
+       score was "passed" or "warning". Previously overallStatus was
+       computed only from checks, so a critical secret finding (gate
+       failed) could still let the audit complete and create a packaging
+       approval. */
+    const anyGateFailed = parityGates.some((g) => g.status === "failed");
+    const effectiveParityStatus: "passed" | "warning" | "failed" =
+      anyGateFailed ? "failed" : overallStatus;
+
     /* The audit→completed, parity report, outcome event and job→completed
        transitions are committed together. A crash between them used to leave
        a completed audit with a still-`running` job (or vice versa); the
@@ -475,7 +496,7 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
         .insert(parityReports)
         .values({
           auditId,
-          overallStatus,
+          overallStatus: effectiveParityStatus,
           score: parityScore,
           environment,
           checks,
@@ -485,7 +506,7 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
           target: [parityReports.auditId],
           targetWhere: sql`${parityReports.auditId} IS NOT NULL`,
           set: {
-            overallStatus,
+            overallStatus: effectiveParityStatus,
             score: parityScore,
             checks,
             gates: parityGates,
@@ -493,6 +514,37 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
           },
         });
 
+      /* Parity gate enforcement: if effective parity failed (either from
+         checks or from a gate), the audit is marked failed and NO
+         audit.completed success event is emitted — only a parity.gate.failed
+         event. Previously the engine emitted audit.completed (success) and
+         THEN flipped the audit to failed, making the event feed
+         self-contradictory. */
+      if (effectiveParityStatus === "failed") {
+        await tx
+          .update(audits)
+          .set({ status: "failed", score: auditScore, finishedAt: new Date(), stages })
+          .where(eq(audits.id, auditId));
+        await tx.insert(events).values({
+          type: "parity.gate.failed",
+          severity: "error",
+          source: "auditor",
+          message: `${audit.name} — parity gate FAILED, packaging approval blocked`,
+        });
+        if (jobId) {
+          const leaseFilter = leaseToken
+            ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken), eq(jobs.status, "running"))
+            : eq(jobs.id, jobId);
+          await tx
+            .update(jobs)
+            .set({ status: "failed", progress: 100, finishedAt: new Date(), heartbeatAt: new Date(), updatedAt: new Date(), errorCode: "PARITY_GATE_FAILED", errorMessage: "parity gate failed — packaging blocked" })
+            .where(leaseFilter)
+            .returning({ id: jobs.id });
+        }
+        return; // do NOT emit audit.completed, do NOT create the packaging approval
+      }
+
+      /* Only emit audit.completed when parity is passed or warning. */
       await tx
         .update(audits)
         .set({
@@ -512,36 +564,6 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
         message: `${audit.name} completed (real engine) — score ${auditScore}, ${inv.findings.length} findings, parity ${parityScore}%`,
       });
 
-      /* Parity gate enforcement: if parity failed, the audit cannot be
-         "completed" and no packaging approval is created — the bundle would
-         contain a known-bad reconstruction. The audit is marked failed and
-         the job finishes as failed. Previously the approval was created
-         unconditionally, so a failed parity gate still produced a green
-         "Package reconstruction bundle" approval request. */
-      if (overallStatus === "failed") {
-        await tx
-          .update(audits)
-          .set({ status: "failed", score: auditScore, finishedAt: new Date(), stages })
-          .where(eq(audits.id, auditId));
-        await tx.insert(events).values({
-          type: "parity.gate.failed",
-          severity: "error",
-          source: "auditor",
-          message: `${audit.name} — parity gate FAILED, packaging approval blocked`,
-        });
-        if (jobId) {
-          const leaseFilter = leaseToken
-            ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken))
-            : eq(jobs.id, jobId);
-          await tx
-            .update(jobs)
-            .set({ status: "failed", progress: 100, finishedAt: new Date(), heartbeatAt: new Date(), updatedAt: new Date(), errorCode: "PARITY_GATE_FAILED", errorMessage: "parity gate failed — packaging blocked" })
-            .where(leaseFilter)
-            .returning({ id: jobs.id });
-        }
-        return; // do NOT create the packaging approval
-      }
-
       /* The owning job finishes with the audit — previously audit.run jobs were
          skipped by the job runner and stayed `running` forever.
          Lease fencing: the update only matches if lease_token still equals the
@@ -550,8 +572,12 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
          this update matches 0 rows — the worker lost ownership and must not
          finalize. We detect the 0-row case and abort the transaction. */
       if (jobId) {
+        /* Lease filter must check status = 'running' too — cancelAudit sets
+           status = 'cancelled' and clears lease_token. Without the status
+           check, a cancelled job could still be finalized by a stale worker
+           if the token clear hasn't propagated yet (TOCTOU). */
         const leaseFilter = leaseToken
-          ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken))
+          ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken), eq(jobs.status, "running"))
           : eq(jobs.id, jobId);
         const finalized = await tx
           .update(jobs)
@@ -577,9 +603,9 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
       await tx.execute(sql`
         INSERT INTO approvals (id, action_type, target_type, target_id, title, status, environment, requested_by, payload)
         VALUES (gen_random_uuid(), 'artifact.package', 'audit', ${auditId},
-                ${`Package reconstruction bundle của ${audit.name} (local artifact)${overallStatus === "warning" ? " [parity warning]" : ""}`},
+                ${`Package reconstruction bundle của ${audit.name} (local artifact)${effectiveParityStatus === "warning" ? " [parity warning]" : ""}`},
                 'pending', ${environment}, 'auditor-service',
-                ${JSON.stringify({ auditId, target: "audit/recon/bundle.tar.zst", parityStatus: overallStatus })}::jsonb)
+                ${JSON.stringify({ auditId, target: "audit/recon/bundle.tar.zst", parityStatus: effectiveParityStatus })}::jsonb)
         ON CONFLICT (action_type, target_id) WHERE status = 'pending' DO NOTHING
       `);
     });
@@ -611,10 +637,14 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
        must NOT clobber the new owner's audit state. We check the job's
        lease_token first — if it doesn't match, the audit is no longer ours. */
     if (leaseToken && jobId) {
-      const [currentJob] = await db.select({ leaseToken: jobs.leaseToken }).from(jobs).where(eq(jobs.id, jobId)).limit(1);
-      if (!currentJob || currentJob.leaseToken !== leaseToken) {
-        /* Lease lost during error path — another worker owns the audit now.
-           Do not write audit/job/event state. */
+      /* Error path lease check must also verify status = 'running' —
+         cancelAudit sets status = 'cancelled' and clears lease_token.
+         A stale worker whose job was cancelled must not write failure
+         state on top of the cancellation. */
+      const [currentJob] = await db.select({ leaseToken: jobs.leaseToken, status: jobs.status }).from(jobs).where(eq(jobs.id, jobId)).limit(1);
+      if (!currentJob || currentJob.leaseToken !== leaseToken || currentJob.status !== "running") {
+        /* Lease lost during error path — another worker owns the audit now,
+           or the job was cancelled. Do not write audit/job/event state. */
         return;
       }
     }
@@ -631,7 +661,7 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
       const job = jobRows[0];
       const exhausted = !job || job.attempt >= job.maxAttempts;
       const leaseFilter = leaseToken
-        ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken))
+        ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken), eq(jobs.status, "running"))
         : eq(jobs.id, jobId);
       await db
         .update(jobs)

@@ -512,15 +512,33 @@ export async function scanDatabase(target?: AuditTarget): Promise<ScanResult> {
       let migrationVersion: string | null = null;
       let migrationLedgerPresent = false;
       try {
-        const journal = await query<{ version: string }>(
-          `select version from __drizzle_migrations order by created_at desc limit 1`,
+        /* Drizzle's migration ledger is `__drizzle_migrations` in the public
+           schema (or `drizzle.__drizzle_migrations` if a schema was set).
+           The `version` column is a serial int (not string). We check both
+           the default schema and the `drizzle` schema to handle both cases.
+           The `hash` column confirms it's a real drizzle ledger, not a
+           coincidentally-named table. */
+        const journal = await query<{ version: number; hash: string }>(
+          `select version, hash from __drizzle_migrations order by created_at desc limit 1`,
         );
         if (journal.rows.length) {
-          migrationVersion = journal.rows[0].version;
+          migrationVersion = String(journal.rows[0].version);
           migrationLedgerPresent = true;
         }
       } catch {
-        /* __drizzle_migrations table doesn't exist — db:push was used, no ledger */
+        /* __drizzle_migrations table doesn't exist in public schema — try
+           the drizzle schema, or db:push was used (no ledger). */
+        try {
+          const journal = await query<{ version: number; hash: string }>(
+            `select version, hash from drizzle.__drizzle_migrations order by created_at desc limit 1`,
+          );
+          if (journal.rows.length) {
+            migrationVersion = String(journal.rows[0].version);
+            migrationLedgerPresent = true;
+          }
+        } catch {
+          /* neither schema has the ledger table */
+        }
       }
       if (!migrationLedgerPresent) {
         warnings.push("no __drizzle_migrations table — migration ledger absent (db:push was used or DB is empty)");

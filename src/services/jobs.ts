@@ -84,8 +84,14 @@ export async function enqueueJob(
  * "inline-demo" and there is only one inline runner.
  */
 export async function advanceJobsOnce(workerId?: string): Promise<void> {
+  /* Production workers must only advance their OWN jobs. Previously the
+     filter included `lockedBy = 'inline-demo'`, so a production worker
+     could advance (and thus run executors for) demo jobs — a stale demo
+     job would be finalized by the production worker, mixing demo and
+     production state. Demo mode (no workerId) advances all running jobs
+     including inline-demo, which is correct for single-process demo. */
   const ownerFilter = workerId
-    ? and(eq(jobs.status, "running"), or(eq(jobs.lockedBy, workerId), eq(jobs.lockedBy, "inline-demo")))
+    ? and(eq(jobs.status, "running"), eq(jobs.lockedBy, workerId))
     : eq(jobs.status, "running");
   const active = await db.select().from(jobs).where(ownerFilter);
   const now = Date.now();

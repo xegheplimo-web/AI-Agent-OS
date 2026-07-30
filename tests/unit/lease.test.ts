@@ -64,7 +64,7 @@ describe("createLeaseFence — no-op when no lease token", () => {
 
 describe("createLeaseFence — lease loss detection", () => {
   it("assert throws LeaseLostError when the DB row no longer holds our token", async () => {
-    selectLeaseToken.mockResolvedValue([{ leaseToken: "someone-elses-token" }]);
+    selectLeaseToken.mockResolvedValue([{ leaseToken: "someone-elses-token", status: "running", lockedBy: "other" }]);
     const fence = createLeaseFence("job-1", "our-token");
     await expect(fence.assert()).rejects.toBeInstanceOf(LeaseLostError);
     fence.stop();
@@ -77,10 +77,17 @@ describe("createLeaseFence — lease loss detection", () => {
     fence.stop();
   });
 
-  it("assert resolves when the DB row still holds our token", async () => {
-    selectLeaseToken.mockResolvedValue([{ leaseToken: "our-token" }]);
+  it("assert resolves when the DB row still holds our token and status is running", async () => {
+    selectLeaseToken.mockResolvedValue([{ leaseToken: "our-token", status: "running", lockedBy: "worker-1" }]);
     const fence = createLeaseFence("job-1", "our-token");
     await expect(fence.assert()).resolves.toBeUndefined();
+    fence.stop();
+  });
+
+  it("assert throws LeaseLostError when status is not running (cancelled)", async () => {
+    selectLeaseToken.mockResolvedValue([{ leaseToken: "our-token", status: "cancelled", lockedBy: null }]);
+    const fence = createLeaseFence("job-1", "our-token");
+    await expect(fence.assert()).rejects.toBeInstanceOf(LeaseLostError);
     fence.stop();
   });
 
@@ -91,7 +98,7 @@ describe("createLeaseFence — lease loss detection", () => {
     await vi.advanceTimersByTimeAsync(15_000);
     expect(fence.leaseLost()).toBe(true);
     /* subsequent assert throws without even hitting the DB select */
-    selectLeaseToken.mockResolvedValue([{ leaseToken: "our-token" }]);
+    selectLeaseToken.mockResolvedValue([{ leaseToken: "our-token", status: "running", lockedBy: "worker-1" }]);
     await expect(fence.assert()).rejects.toBeInstanceOf(LeaseLostError);
     fence.stop();
   });

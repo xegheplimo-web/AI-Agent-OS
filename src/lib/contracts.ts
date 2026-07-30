@@ -194,7 +194,7 @@ export const approvalDtoSchema = z.object({
   targetType: z.string(),
   targetId: z.string(),
   title: z.string(),
-  status: z.enum(["pending", "approved", "rejected"]),
+  status: z.enum(["pending", "approved", "rejected", "expired"]),
   environment: z.string(),
   requestedBy: z.string(),
   requestedAt: z.string(),
