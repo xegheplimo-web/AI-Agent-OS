@@ -616,7 +616,7 @@
           "name": "active_bucket",
           "type": "text",
           "primaryKey": false,
-          "notNull": true,
+          "notNull": false,
           "generated": {
             "as": "CASE WHEN \"status\" IN ('running', 'waiting_approval') THEN 'active' ELSE NULL END",
             "type": "stored"

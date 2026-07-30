@@ -73,10 +73,12 @@ export const audits = pgTable("audits", {
   /* Generated column: 'active' when status is running/waiting_approval,
      NULL otherwise. Backs the audits_active_uidx partial unique index so
      only one audit may be active at a time. Stored (not virtual) so the
-     index can use it without recomputing the expression. */
+     index can use it without recomputing the expression. Nullable because
+     non-active audits (completed/failed/cancelled) yield NULL — the partial
+     unique index only covers rows WHERE active_bucket IS NOT NULL. */
   activeBucket: text("active_bucket").generatedAlwaysAs(
     sql`CASE WHEN "status" IN ('running', 'waiting_approval') THEN 'active' ELSE NULL END`,
-  ).notNull(),
+  ),
 }, (t) => [
   index("audits_status_idx").on(t.status),
   index("audits_started_at_idx").on(t.startedAt),
