@@ -132,6 +132,10 @@ async function main() {
   check("re-running an audit upserts findings (no duplicates)", afterFindings === beforeFindings, `${beforeFindings} → ${afterFindings}`);
 
   /* ---------- 10. stale recovery covers audit.run ---------------------- */
+  /* Mark the previous audit as completed so the active_bucket unique index
+     doesn't block the stale audit insert (only one audit can be active at
+     a time). */
+  await db.update(audits).set({ status: "completed", finishedAt: new Date() }).where(eq(audits.id, auditId));
   const [staleAudit] = await db.insert(audits).values({
     name: `AUD-STALE-${Date.now().toString().slice(-5)}`, triggerType: "ci", status: "running",
     stages: [], environment: "local", requestedBy: "verify", startedAt: new Date(),
