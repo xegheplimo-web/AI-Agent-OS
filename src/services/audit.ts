@@ -703,7 +703,7 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
       payload: { auditId, target: "audit/recon/bundle.tar.zst", parityStatus: overallStatus },
     }).onConflictDoNothing({
       target: [approvals.actionType, approvals.targetId],
-      targetWhere: sql`status = 'pending'`,
+      where: sql`status = 'pending'`,
     });
 
     await tx
