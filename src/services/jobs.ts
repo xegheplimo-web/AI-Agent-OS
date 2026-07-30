@@ -136,10 +136,12 @@ export async function advanceJobsOnce(workerId?: string): Promise<void> {
           });
         }
       } catch (err) {
-        /* LEASE_LOST is silent: the worker lost ownership (stale supervisor
-           requeued the job, another worker claimed it). The new owner will
-           handle it. This worker must NOT mark the job failed/retried or emit
-           a failure event — that would race the new owner's completion. */
+        /* LEASE_LOST: the worker lost ownership (stale supervisor requeued the
+           job, another worker claimed it). The new owner will handle it. This
+           worker must NOT mark the job failed/retried — that would race the
+           new owner's completion. It DOES emit a `job.requeued` warning event
+           so operators can see the lease change in the event feed (this is
+           observability, not a state mutation). */
         if (err instanceof LeaseLostError) {
           await db.insert(events).values({
             type: "job.requeued",

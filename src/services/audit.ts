@@ -519,46 +519,60 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
   });
   const { score: parityScore, overallStatus } = computeParityScore(checks);
 
-  await db
-    .insert(parityReports)
-    .values({
-      auditId,
-      overallStatus,
-      score: parityScore,
+  /* Demo finalize: parity report + events + package approval + job
+     completion in ONE transaction — mirrors the real engine's finalize tx
+     so a crash cannot leave the audit completed with no packaging approval
+     (or vice versa). The audit UPDATE above is separate (it sets the
+     running→completed transition) but the rest is atomic. */
+  await db.transaction(async (tx) => {
+    await tx
+      .insert(parityReports)
+      .values({
+        auditId,
+        overallStatus,
+        score: parityScore,
+        environment: audit?.environment ?? "production",
+        checks,
+        gates: PARITY_GATES.map((g) => ({ ...g })),
+      })
+      .onConflictDoUpdate({
+        target: [parityReports.auditId],
+        targetWhere: sql`${parityReports.auditId} IS NOT NULL`,
+        set: { overallStatus, score: parityScore, checks, gates: PARITY_GATES.map((g) => ({ ...g })) },
+      });
+
+    await tx.insert(events).values([
+      {
+        type: "audit.completed",
+        severity: "success",
+        source: "auditor",
+        message: `${audit?.name ?? "Audit"} completed — score ${score}, ${picked.length} findings, parity ${parityScore}%`,
+      },
+      {
+        type: "parity.gate",
+        severity: overallStatus === "passed" ? "success" : "warning",
+        source: "auditor",
+        message: `Parity gate ${overallStatus}: ${checks.filter((c) => c.status === "passed").length}/${checks.length} checks green`,
+      },
+    ]);
+
+    /* human-in-the-loop: packaging the reconstruction bundle needs approval.
+       Inside the transaction so the demo path matches production — the audit
+       cannot end up completed with no packaging approval. */
+    await tx.insert(approvals).values({
+      actionType: "artifact.package",
+      targetType: "audit",
+      targetId: auditId,
+      title: `Package reconstruction bundle của ${audit?.name ?? "audit"} (local artifact)`,
       environment: audit?.environment ?? "production",
-      checks,
-      gates: PARITY_GATES.map((g) => ({ ...g })),
-    })
-    .onConflictDoUpdate({
-      target: [parityReports.auditId],
-      targetWhere: sql`${parityReports.auditId} IS NOT NULL`,
-      set: { overallStatus, score: parityScore, checks, gates: PARITY_GATES.map((g) => ({ ...g })) },
+      requestedBy: "auditor-service",
+      payload: { auditId, target: "audit/recon/bundle.tar.zst" },
     });
 
-  await db.insert(events).values([
-    {
-      type: "audit.completed",
-      severity: "success",
-      source: "auditor",
-      message: `${audit?.name ?? "Audit"} completed — score ${score}, ${picked.length} findings, parity ${parityScore}%`,
-    },
-    {
-      type: "parity.gate",
-      severity: overallStatus === "passed" ? "success" : "warning",
-      source: "auditor",
-      message: `Parity gate ${overallStatus}: ${checks.filter((c) => c.status === "passed").length}/${checks.length} checks green`,
-    },
-  ]);
-
-  /* human-in-the-loop: packaging the reconstruction bundle needs approval */
-  await db.insert(approvals).values({
-    actionType: "artifact.package",
-    targetType: "audit",
-    targetId: auditId,
-    title: `Package reconstruction bundle của ${audit?.name ?? "audit"} (local artifact)`,
-    environment: audit?.environment ?? "production",
-    requestedBy: "auditor-service",
-    payload: { auditId, target: "audit/recon/bundle.tar.zst" },
+    await tx
+      .update(jobs)
+      .set({ status: "completed", progress: 100, finishedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(jobs.type, "audit.run"), eq(jobs.auditId, auditId)));
   });
 
   await logAudit({
@@ -568,11 +582,6 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
     resourceId: auditId,
     detail: { score, findings: counts, parityScore },
   });
-
-  await db
-    .update(jobs)
-    .set({ status: "completed", progress: 100, finishedAt: new Date(), updatedAt: new Date() })
-    .where(and(eq(jobs.type, "audit.run"), eq(jobs.auditId, auditId)));
 }
 
 const BOUNDS_TOTAL = STAGE_DURATION_MS.reduce((a, b) => a + b, 0);

@@ -2,6 +2,10 @@
   "name": "ai-agent-os",
   "version": "0.5.0",
   "private": true,
+  "engines": {
+    "node": ">=22 <23",
+    "npm": ">=10.9.8 <11"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",

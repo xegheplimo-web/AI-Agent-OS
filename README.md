@@ -176,8 +176,10 @@ make docker-up            # full stack qua compose
 
 ## Testing & CI
 
-- **Vitest**: `tests/unit/` — audit stage machine, parity scoring/diff (fail-closed, db_schema fail-closed), lease fence (LeaseLostError, heartbeat eviction), knowledge index (Unicode tokenizer, scoped deletion), self-approval forbid, contracts, auth (scrypt, role permissions, requirePermission 401/403), utils.
-- **GitHub Actions** (`.github/workflows/ci.yml`): install → lint → typecheck → push schema → **verify migrations apply trên DB sạch** (`db:migrate` vào database trống riêng, đếm rows `__drizzle_migrations`, kiểm tra bảng `audits` được tạo) → seed → tests → verify:worker → verify:executors → verify:release → build → API smoke test với PostgreSQL service → Docker build + smoke (với `--add-host=host.docker.internal:host-gateway` cho Linux runner). Smoke test verify: `/api/health` public, authenticated routes cần service token, unauthenticated request bị 401.
+- **Vitest**: `tests/unit/` — audit stage machine, parity scoring/diff (fail-closed, db_schema fail-closed), lease fence (LeaseLostError, heartbeat eviction), knowledge index (Unicode tokenizer, scoped deletion), self-approval forbid, contracts, auth (scrypt, role permissions, requirePermission 401/403), utils. **90 tests, all green locally trên Node 22 / npm 10.9.8.**
+- **GitHub Actions** (`.github/workflows/ci.yml`): install → lint → typecheck → push schema → **verify migrations apply trên DB sạch** (`db:migrate` vào database trống riêng, đếm rows `__drizzle_migrations`, kiểm tra bảng `audits` được tạo) → seed → tests → verify:worker → verify:executors → verify:release → build → API smoke test với PostgreSQL service → Docker build + smoke (với `--add-host=host.docker.internal:host-gateway` cho Linux runner).
+- **Toolchain**: Node 22 + npm 10.9.8 là canonical (CI và Docker cùng dùng Node 22). `package.json` khai báo `engines`, `.nvmrc` pin Node 22. Lockfile phải được tạo/cập nhật bằng npm 10 — npm 11 (Node 24) sinh layout `tsx → esbuild` khác và `npm ci` trên CI (npm 10) sẽ từ chối.
+- **CI status**: các bước migration/executor/Docker verification đã được thêm vào workflow nhưng **chưa từng chạy xanh trên GitHub** do lockfile mismatch (đã sửa trong branch này, chờ merge). Không tuyên bố "CI verification complete" cho đến khi run mới nhất pass.
 
 ## Worker (production queue)
 
@@ -189,7 +191,7 @@ APP_MODE=production npm run worker
 **Ownership rule**: mỗi `audit.run` job mang `auditId`; worker chỉ chạy audit của job **chính nó đã claim** (`locked_by = workerId`, `lease_token = token`). Quét `audits WHERE status='running'` sẽ khiến hai worker cùng chạy một audit — đó là lỗi đã được sửa và có regression test. `advanceJobsOnce(workerId)` cũng lọc theo `locked_by` cho non-audit jobs, nên hai worker không cùng advance một job.
 
 - **Lease fencing**: `heartbeat()` và `setJobProgress()` dùng `RETURNING` — nếu stale supervisor requeue job (clear lease_token) và worker khác claim, update từ worker cũ match 0 rows → throw `LeaseLostError` → worker cũ dừng ngay, không ghi thêm. `assertLease()` kiểm tra trước mỗi nhóm side effect (scanner, findings, reconstruction, finalize). **Non-audit executors** cũng nhận một `LeaseFence` và gọi `assert()` trước mỗi ghi (artifact upsert, parity report, settings insert) — worker cũ không tiếp tục ghi artifact/report đè lên run của worker mới. Background heartbeat timer 15s giữ job alive khi scanner/executor chạy lâu.
-- **LEASE_LOST silent exit**: khi lease bị mất, worker cũ thoát im lặng — không sửa audit/job/event, không requeue/fail (để worker mới xử lý), chỉ phát event `job.requeued` cảnh báo
+- **LEASE_LOST exit**: khi lease bị mất, worker cũ không sửa audit/job state, không requeue/fail (để worker mới xử lý), chỉ phát event `job.requeued` cảnh báo (observability, không phải state mutation)
 - Claim: `FOR UPDATE SKIP LOCKED`, `attempt < max_attempts`, **`LIMIT 1`** (worker xử lý tuần tự; claim 3 sẽ để 2 job kẹt `running` không heartbeat cho đến khi stale supervisor requeue)
 - **Retry đúng maxAttempts**: non-audit executor error → requeue (`status: "queued"`) khi `attempt < maxAttempts`, fail khi hết. Trước đây luôn `status: "failed"` bỏ qua retry budget
 - Heartbeat trong suốt audit; job hoàn tất **cùng** audit trong một transaction (parity upsert + audit→completed + event + job→completed + approval `artifact.package` commit cùng nhau)
@@ -280,7 +282,7 @@ src-tauri/                # desktop scaffold
 - [x] ~~Scoped knowledge index không xóa artifact đã bị xóa~~ — đã sửa (`auditDocs` map evict postings cũ; `scopedToAudit`→`lastScopedAudit`)
 - [x] ~~Active-audit concurrency race~~ — đã sửa (partial unique index `audits_active_uidx`)
 - [x] ~~Self-approval~~ — đã sửa (requester không approve yêu cầu của chính mình)
-- [x] ~~CI migration validation~~ — đã sửa (`db:migrate` apply trên DB sạch, Docker `--add-host`)
+- [x] ~~CI migration validation~~ — đã thêm bước `db:migrate` apply trên DB sạch + Docker `--add-host` (chưa từng chạy xanh do lockfile mismatch, đã sửa trong branch này)
 - [ ] OTLP ingestion thật (điểm cắm `src/services/telemetry.ts`) → `source: "otlp"`
 - [ ] GitHub push thật cho reconstruction bundle (hiện `artifact.package` chỉ package local, chưa push)
 - [ ] Artifact object storage (MinIO/S3) — metadata đã sẵn (storageProvider/storageKey/sha256)
