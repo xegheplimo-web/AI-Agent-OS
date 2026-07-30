@@ -633,10 +633,30 @@ export function hasExecutor(jobType: string): boolean {
  *  caller must mark the job failed with errorCode NO_EXECUTOR rather than
  *  silently completing it. The optional `lease` lets the executor abort
  *  (LeaseLostError) before each side effect if it lost job ownership. */
+/* Default no-op fence for executors called without a lease (verify scripts,
+   demo mode). This ensures fencedWrite still runs the callback in a
+   transaction even when no lease is provided. */
+const noopFence: LeaseFence = {
+  jobId: "",
+  leaseToken: null,
+  leaseLost: () => false,
+  assert: async () => {},
+  fencedJobUpdate: async (set) => {
+    if (!set) return 0;
+    return 1;
+  },
+  fencedWrite: async (fn) => {
+    await db.transaction(async (tx) => { await fn(tx); });
+  },
+  stop: () => {},
+};
+
 export async function runExecutor(job: JobRow, lease?: LeaseFence): Promise<void> {
   const exec = EXECUTORS[job.type];
   if (!exec) throw new Error(`NO_EXECUTOR: no executor registered for job type "${job.type}"`);
-  await exec(job, lease);
+  /* Always provide a fence so fencedWrite runs — use noopFence when no lease
+     is given (verify scripts, demo mode). */
+  await exec(job, lease ?? noopFence);
 }
 
 async function loadAuditEnvironment(auditId: string): Promise<string> {
