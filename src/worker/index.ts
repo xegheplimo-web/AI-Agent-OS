@@ -40,7 +40,9 @@ async function main() {
              attempt=attempt+1, updated_at=now()
        WHERE id IN (
          SELECT id FROM jobs
-          WHERE status='queued' AND attempt < max_attempts
+          WHERE status='queued'
+            AND attempt < max_attempts
+            AND locked_by IS DISTINCT FROM 'inline-demo'
           ORDER BY created_at
           FOR UPDATE SKIP LOCKED
           LIMIT 1

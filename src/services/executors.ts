@@ -485,31 +485,46 @@ export async function executeKnowledgeReindex(job: JobRow, lease?: LeaseFence): 
     ? await db.select().from(artifacts).where(eq(artifacts.auditId, job.auditId))
     : await db.select().from(artifacts);
 
-  /* Load existing global index to merge into (if this is a scoped reindex). */
+  /* Load existing global index to merge into (if this is a scoped reindex).
+     Use a transaction with SELECT FOR UPDATE to prevent two concurrent
+     knowledge.reindex jobs from both reading the same index, merging, and
+     overwriting each other (lost update). The row-level lock serializes
+     the read+merge+write so the second job sees the first's changes. */
   type IndexShape = {
     postings: Record<string, Array<{ artifactId: number; path: string; tf: number }>>;
     docLengths: Record<number, number>;
     auditDocs?: Record<string, number[]>;
   };
   let existingIndex: IndexShape | null = null;
-  if (job.auditId) {
-    const existing = await db.select().from(settings).where(eq(settings.key, "knowledge.invertedIndex")).limit(1);
-    if (existing.length) {
-      existingIndex = existing[0].value as IndexShape;
+
+  /* The merge + persist is wrapped in a transaction with FOR UPDATE on the
+     settings row. This serializes concurrent reindex jobs: the second job
+     blocks until the first commits, then reads the updated index. */
+  const index = await db.transaction(async (tx) => {
+    if (job.auditId) {
+      const existing = await tx.execute(
+        sql`SELECT value FROM settings WHERE key = 'knowledge.invertedIndex' FOR UPDATE`,
+      );
+      const rows_ = (existing.rows ?? []) as Array<{ value: IndexShape }>;
+      if (rows_.length) {
+        existingIndex = rows_[0].value;
+      }
     }
-  }
 
-  /* Pure merge/rebuild — see buildMergedIndex. Evicts postings for the
-     audit's previous artifacts (including deleted ones) before re-inserting. */
-  const index = buildMergedIndex(existingIndex, rows, job.auditId);
+    /* Pure merge/rebuild — see buildMergedIndex. Evicts postings for the
+       audit's previous artifacts (including deleted ones) before re-inserting. */
+    const merged = buildMergedIndex(existingIndex, rows, job.auditId);
 
-  /* Lease fencing before persisting the merged index — a stale worker must
-     not overwrite the index another worker already rebuilt. */
-  await lease?.assert();
-  await db
-    .insert(settings)
-    .values({ key: "knowledge.invertedIndex", value: index })
-    .onConflictDoUpdate({ target: [settings.key], set: { value: index, updatedAt: new Date() } });
+    /* Lease fencing before persisting the merged index — a stale worker must
+       not overwrite the index another worker already rebuilt. */
+    await lease?.assert();
+    await tx
+      .insert(settings)
+      .values({ key: "knowledge.invertedIndex", value: merged })
+      .onConflictDoUpdate({ target: [settings.key], set: { value: merged, updatedAt: new Date() } });
+
+    return merged;
+  });
 
   /* Persist a manifest artifact so the reindex is visible in the artifact
      browser and has a sha256 like every other export. */

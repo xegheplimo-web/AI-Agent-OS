@@ -512,6 +512,36 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
         message: `${audit.name} completed (real engine) — score ${auditScore}, ${inv.findings.length} findings, parity ${parityScore}%`,
       });
 
+      /* Parity gate enforcement: if parity failed, the audit cannot be
+         "completed" and no packaging approval is created — the bundle would
+         contain a known-bad reconstruction. The audit is marked failed and
+         the job finishes as failed. Previously the approval was created
+         unconditionally, so a failed parity gate still produced a green
+         "Package reconstruction bundle" approval request. */
+      if (overallStatus === "failed") {
+        await tx
+          .update(audits)
+          .set({ status: "failed", score: auditScore, finishedAt: new Date(), stages })
+          .where(eq(audits.id, auditId));
+        await tx.insert(events).values({
+          type: "parity.gate.failed",
+          severity: "error",
+          source: "auditor",
+          message: `${audit.name} — parity gate FAILED, packaging approval blocked`,
+        });
+        if (jobId) {
+          const leaseFilter = leaseToken
+            ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken))
+            : eq(jobs.id, jobId);
+          await tx
+            .update(jobs)
+            .set({ status: "failed", progress: 100, finishedAt: new Date(), heartbeatAt: new Date(), updatedAt: new Date(), errorCode: "PARITY_GATE_FAILED", errorMessage: "parity gate failed — packaging blocked" })
+            .where(leaseFilter)
+            .returning({ id: jobs.id });
+        }
+        return; // do NOT create the packaging approval
+      }
+
       /* The owning job finishes with the audit — previously audit.run jobs were
          skipped by the job runner and stayed `running` forever.
          Lease fencing: the update only matches if lease_token still equals the
@@ -537,15 +567,17 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
          transaction so the audit cannot end up "completed" with no packaging
          approval (or vice versa) if one write succeeds and the other fails.
          Previously this insert ran after the transaction committed, leaving a
-         window where a crash orphaned the approval or the completed audit. */
+         window where a crash orphaned the approval or the completed audit.
+         Parity gate: only created when parity is "passed" or "warning" —
+         a "failed" parity blocks packaging (see above). */
       await tx.insert(approvals).values({
         actionType: "artifact.package",
         targetType: "audit",
         targetId: auditId,
-        title: `Package reconstruction bundle của ${audit.name} (local artifact)`,
+        title: `Package reconstruction bundle của ${audit.name} (local artifact)${overallStatus === "warning" ? " [parity warning]" : ""}`,
         environment,
         requestedBy: "auditor-service",
-        payload: { auditId, target: "audit/recon/bundle.tar.zst" },
+        payload: { auditId, target: "audit/recon/bundle.tar.zst", parityStatus: overallStatus },
       });
     });
 

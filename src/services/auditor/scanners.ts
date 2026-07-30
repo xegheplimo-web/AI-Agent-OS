@@ -484,6 +484,7 @@ export async function scanDatabase(target?: AuditTarget): Promise<ScanResult> {
       );
 
       const indexRows = indexes.rows ?? [];
+      const tableRows = tables.rows ?? [];
       const missingIndexes = (candidates.rows ?? []).filter(
         (c) =>
           !indexRows.some(
@@ -494,15 +495,48 @@ export async function scanDatabase(target?: AuditTarget): Promise<ScanResult> {
       const warnings: string[] = [];
       if (missingIndexes.length) warnings.push(`${missingIndexes.length} hot column(s) without an index`);
 
+      /* Empty-schema false-green guard: a connection to a database with 0
+         tables in public is NOT a healthy schema — it means migrations were
+         never applied (or the wrong database was connected to). Previously
+         this returned 0 missingIndexes and the parity check read "passed".
+         Now we flag it as a warning so db_schema cannot be "passed" on an
+         empty database. */
+      if (tableRows.length === 0) {
+        warnings.push("target database has 0 tables in public schema — migrations may not have been applied");
+      }
+
+      /* Migration state: check for the drizzle migrations journal table.
+         If it exists, report the latest applied migration. If it doesn't,
+         the database was set up via db:push (schema-only, no ledger) or is
+         empty — either way, migration state is "unknown". */
+      let migrationVersion: string | null = null;
+      let migrationLedgerPresent = false;
+      try {
+        const journal = await query<{ version: string }>(
+          `select version from __drizzle_migrations order by created_at desc limit 1`,
+        );
+        if (journal.rows.length) {
+          migrationVersion = journal.rows[0].version;
+          migrationLedgerPresent = true;
+        }
+      } catch {
+        /* __drizzle_migrations table doesn't exist — db:push was used, no ledger */
+      }
+      if (!migrationLedgerPresent) {
+        warnings.push("no __drizzle_migrations table — migration ledger absent (db:push was used or DB is empty)");
+      }
+
       return scan.ok(
         {
           targetDatabase: "[redacted]",
           skipped: false,
-          tableCount: (tables.rows ?? []).length,
-          tables: (tables.rows ?? []).map((r) => ({ table: r.table_name, columns: Number(r.columns), rows: null })),
+          tableCount: tableRows.length,
+          tables: tableRows.map((r) => ({ table: r.table_name, columns: Number(r.columns), rows: null })),
           indexCount: indexRows.length,
           indexes: indexRows.map((r) => ({ table: r.tablename, index: r.indexname, definition: r.indexdef })),
           missingIndexes: missingIndexes.map((r) => ({ table: r.table_name, column: r.column_name })),
+          migrationLedgerPresent,
+          migrationVersion,
         },
         ["raw/database_inventory.json"],
         warnings,

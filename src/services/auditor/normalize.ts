@@ -191,12 +191,14 @@ export function parityChecksFrom(
   }).length;
 
   /* DB measurement evidence: the database-inventory scanner must have run
-     AND not failed. When the scanner was skipped (no TARGET_DATABASE_URL) or
-     failed, there is no evidence about the target DB, so db_schema must NOT
-     read "passed" — that would be a false-green (an unmeasured DB reported
-     as healthy). Fail-closed: no evidence => pending. */
+     AND not failed AND found at least one table. When the scanner was skipped
+     (no TARGET_DATABASE_URL), failed, or connected to an empty schema, there
+     is no evidence of a healthy target DB, so db_schema must NOT read
+     "passed" — that would be a false-green. Fail-closed: no evidence => pending. */
   const dbScan = scanResults?.find((r) => r.scanner === "database-inventory");
-  const dbMeasured = !!dbScan && dbScan.status !== "failed";
+  const dbData = dbScan?.data as { tableCount?: number; migrationLedgerPresent?: boolean } | undefined;
+  const dbMeasured = !!dbScan && dbScan.status !== "failed" && (dbData?.tableCount ?? 0) > 0;
+  const dbMigrationLedgerAbsent = dbMeasured && !dbData?.migrationLedgerPresent;
 
   return [
     {
@@ -254,14 +256,16 @@ export function parityChecksFrom(
          unmeasured DB was reported healthy. */
       status: (!dbMeasured
         ? "pending"
-        : inv.schema.missingIndexes.length === 0
+        : inv.schema.missingIndexes.length === 0 && !dbMigrationLedgerAbsent
           ? "passed"
           : "warning") as "passed" | "warning" | "pending",
       ...(!dbMeasured
-        ? { difference: "database-inventory scanner skipped or failed — no DB evidence" }
-        : inv.schema.missingIndexes.length
-          ? { difference: `${inv.schema.missingIndexes.length} missing indexes` }
-          : {}),
+        ? { difference: "database-inventory scanner skipped, failed, or found 0 tables — no DB evidence" }
+        : dbMigrationLedgerAbsent
+          ? { difference: "migration ledger absent — schema may be drift-prone (db:push was used instead of migrations)" }
+          : inv.schema.missingIndexes.length
+            ? { difference: `${inv.schema.missingIndexes.length} missing indexes` }
+            : {}),
     },
     {
       key: "ui_critical_paths",

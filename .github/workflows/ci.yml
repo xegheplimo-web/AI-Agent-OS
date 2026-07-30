@@ -80,7 +80,30 @@ jobs:
             || (echo "::error::migrations did not create the audits_active_uidx index" && exit 1)
           echo "All $(find drizzle -maxdepth 1 -name '*.sql' | wc -l) migration files applied successfully."
 
-      # Re-push schema after the migration verify step dropped all tables.
+      # Upgrade test: apply migrations 0000-0009 (old schema), then apply
+      # 0010 (the latest) on top. This catches ALTER TABLE failures that
+      # only appear when upgrading an existing DB (e.g. NOT NULL column
+      # added to a non-empty table, or an index that already exists).
+      - name: Verify migration upgrade (old schema → latest)
+        run: |
+          # Start fresh: drop everything
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+            "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+          # Apply all migrations EXCEPT the latest (0010)
+          for f in $(find drizzle -maxdepth 1 -name '*.sql' | sort | head -n -1); do
+            PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -v ON_ERROR_STOP=1 -f "$f" >/dev/null \
+              || (echo "::error::Upgrade test: migration $f failed on old schema" && exit 1)
+          done
+          # Insert a row that the latest migration might ALTER (e.g. telemetry_points)
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+            "INSERT INTO telemetry_points (metric, value, ts) VALUES ('latency_p95', 128.0, now());"
+          # Now apply the latest migration on top — this is the upgrade path
+          LATEST=$(find drizzle -maxdepth 1 -name '*.sql' | sort | tail -1)
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -v ON_ERROR_STOP=1 -f "$LATEST" >/dev/null \
+            || (echo "::error::Upgrade test: latest migration $LATEST failed on existing data" && exit 1)
+          echo "Upgrade test passed: $LATEST applied on top of old schema + existing data."
+
+      # Re-push schema after the migration verify step dropped tables.
       # The migration verify intentionally destroys the schema to test the
       # .sql files from scratch; db:push restores it so seed + tests can run.
       - name: Re-push schema (after migration verify dropped tables)

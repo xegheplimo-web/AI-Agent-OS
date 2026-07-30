@@ -344,6 +344,15 @@ export const approvals = pgTable("approvals", {
 }, (t) => [
   index("approvals_status_idx").on(t.status),
   index("approvals_requested_at_idx").on(t.requestedAt),
+  /* Idempotency: only one pending approval per (actionType, targetId).
+     Without this, finalize could create multiple pending "artifact.package"
+     approvals for the same audit (e.g. if the engine retries), and the
+     approver wouldn't know which one to decide. The partial index only
+     constrains rows where status='pending' — decided approvals are
+     unconstrained so history is preserved. */
+  uniqueIndex("approvals_pending_unique_uidx")
+    .on(t.actionType, t.targetId)
+    .where(sql`status = 'pending'`),
 ]);
 
 /* ------------------------------------------------------------------ */

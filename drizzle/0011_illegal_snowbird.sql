@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "approvals_pending_unique_uidx" ON "approvals" USING btree ("action_type","target_id") WHERE status = 'pending';

@@ -118,7 +118,7 @@ describe("parityChecksFrom — db_schema fail-closed when DB scanner skipped", (
      database-inventory entry. Previously db_schema still read "passed"
      because missingIndexes.length === 0 — a false-green: an unmeasured DB
      was reported as healthy. It must be "pending" (no evidence). */
-  function scanResult(scanner: string, status: ScanResult["status"]): ScanResult {
+  function scanResult(scanner: string, status: ScanResult["status"], data: Record<string, unknown> = {}): ScanResult {
     return {
       scanner,
       status,
@@ -128,7 +128,7 @@ describe("parityChecksFrom — db_schema fail-closed when DB scanner skipped", (
       artifacts: [],
       warnings: [],
       error: null,
-      data: {},
+      data,
     };
   }
 
@@ -166,12 +166,12 @@ describe("parityChecksFrom — db_schema fail-closed when DB scanner skipped", (
     expect(db?.status).toBe("pending");
   });
 
-  it("db_schema is passed only when the DB scanner ran successfully AND no missing indexes", () => {
+  it("db_schema is passed only when the DB scanner ran successfully AND no missing indexes AND migration ledger present", () => {
     const inv: NormalizedInventory = {
       ...baseInventory,
       schema: { tables: [{ table: "users", columns: 3, rows: 5 }], indexes: [{ table: "users", index: "idx", definition: "" }], missingIndexes: [] },
     };
-    const results: ScanResult[] = [scanResult("database-inventory", "success")];
+    const results: ScanResult[] = [scanResult("database-inventory", "success", { tableCount: 1, migrationLedgerPresent: true })];
     const checks = parityChecksFrom(inv, 120, results);
     const db = checks.find((c) => c.key === "db_schema");
     expect(db?.status).toBe("passed");
@@ -186,10 +186,32 @@ describe("parityChecksFrom — db_schema fail-closed when DB scanner skipped", (
         missingIndexes: [{ table: "users", column: "email" }],
       },
     };
-    const results: ScanResult[] = [scanResult("database-inventory", "success")];
+    const results: ScanResult[] = [scanResult("database-inventory", "success", { tableCount: 1, migrationLedgerPresent: true })];
     const checks = parityChecksFrom(inv, 120, results);
     const db = checks.find((c) => c.key === "db_schema");
     expect(db?.status).toBe("warning");
+  });
+
+  it("db_schema is warning when DB has tables but no migration ledger (db:push was used)", () => {
+    const inv: NormalizedInventory = {
+      ...baseInventory,
+      schema: { tables: [{ table: "users", columns: 3, rows: 5 }], indexes: [{ table: "users", index: "idx", definition: "" }], missingIndexes: [] },
+    };
+    const results: ScanResult[] = [scanResult("database-inventory", "success", { tableCount: 1, migrationLedgerPresent: false })];
+    const checks = parityChecksFrom(inv, 120, results);
+    const db = checks.find((c) => c.key === "db_schema");
+    expect(db?.status).toBe("warning");
+  });
+
+  it("db_schema is pending when DB scanner ran successfully but found 0 tables (empty schema)", () => {
+    const inv: NormalizedInventory = {
+      ...baseInventory,
+      schema: { tables: [], indexes: [], missingIndexes: [] },
+    };
+    const results: ScanResult[] = [scanResult("database-inventory", "success", { tableCount: 0, migrationLedgerPresent: false })];
+    const checks = parityChecksFrom(inv, 120, results);
+    const db = checks.find((c) => c.key === "db_schema");
+    expect(db?.status).toBe("pending");
   });
 
   it("a skipped DB scanner drags the overall parity off green", () => {

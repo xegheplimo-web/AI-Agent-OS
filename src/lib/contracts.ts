@@ -60,9 +60,21 @@ export const auditDtoSchema = z.object({
 export type AuditDTO = z.infer<typeof auditDtoSchema>;
 
 /* ---- run audit request ---- */
+/* Scope values are validated against the known scope enum. A typo (e.g.
+   "secrts" instead of "secrets") previously filtered to an empty array,
+   which means "scan all scopes" — the opposite of what the user intended.
+   Now an unknown scope value returns 400 with a clear error. */
+export const scopeSchema = z.enum([
+  "filesystem",
+  "packages",
+  "secrets",
+  "database",
+  "runtime",
+  "routes",
+]);
 export const runAuditRequestSchema = z.object({
   environment: environmentSchema.default("production"),
-  scope: z.array(z.string().min(1)).max(20).default([]),
+  scope: z.array(scopeSchema).max(20).default([]),
   idempotencyKey: z.string().min(8).max(96).optional(),
 });
 export type RunAuditRequest = z.infer<typeof runAuditRequestSchema>;
@@ -157,6 +169,11 @@ export type JobDTO = z.infer<typeof jobDtoSchema>;
 export const createJobSchema = z.object({
   type: z.enum(["sbom.export", "parity.gate", "artifact.package", "knowledge.reindex"]),
   target: z.string().min(1).max(200),
+  /* artifact.package and sbom.export require an auditId — the executor
+     loads the audit's environment and scope from it. Without auditId the
+     job fails at runtime. parity.gate and knowledge.reindex can run
+     globally (auditId optional). */
+  auditId: z.string().uuid().optional(),
 });
 
 /* ---- events ---- */

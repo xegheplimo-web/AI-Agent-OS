@@ -24,6 +24,13 @@ export async function POST(req: Request) {
   const parsed = createJobSchema.safeParse(body);
   if (!parsed.success) return Response.json({ error: "Invalid payload" }, { status: 400 });
 
-  const job = await enqueueJob(parsed.data.type, parsed.data.target, actor);
+  /* artifact.package and sbom.export executors require auditId to load the
+     audit's environment and scope. Reject early with a clear 400 instead of
+     letting the job fail at runtime. */
+  if ((parsed.data.type === "artifact.package" || parsed.data.type === "sbom.export") && !parsed.data.auditId) {
+    return Response.json({ error: `${parsed.data.type} requires an auditId` }, { status: 400 });
+  }
+
+  const job = await enqueueJob(parsed.data.type, parsed.data.target, actor, parsed.data.auditId);
   return Response.json(job, { status: 201 });
 }

@@ -45,6 +45,7 @@ export async function enqueueJob(
   type: "sbom.export" | "parity.gate" | "artifact.package" | "knowledge.reindex",
   target: string,
   actor: Actor | null,
+  auditId?: string,
 ): Promise<JobDTO> {
   const [row] = await db
     .insert(jobs)
@@ -52,6 +53,7 @@ export async function enqueueJob(
       type,
       status: isDemoMode ? "running" : "queued",
       target,
+      auditId: auditId ?? null,
       progress: 0,
       attempt: 0,
       worker: isDemoMode ? "inline-demo" : null,

@@ -673,17 +673,34 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
       },
     ]);
 
+    /* Parity gate enforcement: if parity failed, block packaging approval
+       and mark the audit failed — same as the real engine. */
+    if (overallStatus === "failed") {
+      await tx.insert(events).values({
+        type: "parity.gate.failed",
+        severity: "error",
+        source: "auditor",
+        message: `${audit?.name ?? "Audit"} — parity gate FAILED, packaging approval blocked`,
+      });
+      await tx
+        .update(jobs)
+        .set({ status: "failed", progress: 100, finishedAt: new Date(), updatedAt: new Date(), errorCode: "PARITY_GATE_FAILED", errorMessage: "parity gate failed — packaging blocked" })
+        .where(and(eq(jobs.type, "audit.run"), eq(jobs.auditId, auditId)));
+      return;
+    }
+
     /* human-in-the-loop: packaging the reconstruction bundle needs approval.
        Inside the transaction so the demo path matches production — the audit
-       cannot end up completed with no packaging approval. */
+       cannot end up completed with no packaging approval. Only created when
+       parity is "passed" or "warning" — a "failed" parity blocks packaging. */
     await tx.insert(approvals).values({
       actionType: "artifact.package",
       targetType: "audit",
       targetId: auditId,
-      title: `Package reconstruction bundle của ${audit?.name ?? "audit"} (local artifact)`,
+      title: `Package reconstruction bundle của ${audit?.name ?? "audit"} (local artifact)${overallStatus === "warning" ? " [parity warning]" : ""}`,
       environment: audit?.environment ?? "production",
       requestedBy: "auditor-service",
-      payload: { auditId, target: "audit/recon/bundle.tar.zst" },
+      payload: { auditId, target: "audit/recon/bundle.tar.zst", parityStatus: overallStatus },
     });
 
     await tx
