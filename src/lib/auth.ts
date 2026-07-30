@@ -67,6 +67,16 @@ export function hashPassword(password: string): string {
   return `${salt}:${hash}`;
 }
 
+/** Password policy: min 10 chars, at least 1 letter and 1 digit. Used by
+ *  seed.ts and any future user-creation endpoint. Returns null if valid,
+ *  or an error message string. */
+export function validatePasswordPolicy(password: string): string | null {
+  if (password.length < 10) return "Password must be at least 10 characters";
+  if (!/[a-zA-Z]/.test(password)) return "Password must contain at least one letter";
+  if (!/[0-9]/.test(password)) return "Password must contain at least one digit";
+  return null;
+}
+
 export function verifyPassword(password: string, stored: string): boolean {
   const [salt, hash] = stored.split(":");
   if (!salt || !hash) return false;

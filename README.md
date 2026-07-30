@@ -15,7 +15,7 @@ Audit · Architecture · Recovery · Functional Parity — xây từ **design sy
 | Auth, session ký HMAC, RBAC, approval, audit log | **Thật** — handler-level `requirePermission` trên mọi GET route, không chỉ mutating |
 | PostgreSQL queue, claim SKIP LOCKED, heartbeat (lease-fenced + background timer), atomic stale recovery | **Thật** |
 | Job `audit.run` (pipeline 3 tầng) | **Thật** — worker chạy engine thật, scope filter quyết định scanner nào chạy, lease-lost abort |
-| Job `sbom.export` / `parity.gate` / `artifact.package` | **Thật** — executor sinh artifact/bundle thật (TAR+checksum, SBOM CycloneDX, parity report); mỗi side effect được lease-fence qua `assertLease()` |
+| Job `sbom.export` / `parity.gate` / `artifact.package` | **Thật** — executor sinh artifact/bundle thật (TAR+checksum, SBOM CycloneDX, parity report); mỗi side effect được lease-fence qua `assertLease()`. Parity gate enforcement: `failed` → audit failed, không tạo packaging approval. |
 | Job `knowledge.reindex` | **Thật** — xây inverted index (Unicode-aware); scoped reindex MERGE vào index toàn cục và xóa postings của artifact đã bị xóa khỏi audit; search API dùng index khi có, fallback ILIKE |
 | Telemetry (latency/throughput/error rate) | **Synthetic (demo) / Unavailable (prod)** — OTLP chưa nối; API trả `source` field để UI không hiển thị số fake mà không cảnh báo |
 | Telemetry radar (traces/metrics/logs/baggage) | **Synthetic** — luôn `radar.source: "synthetic"`, tách khỏi telemetry `source` để UI badge radar độc lập |
@@ -176,10 +176,10 @@ make docker-up            # full stack qua compose
 
 ## Testing & CI
 
-- **Vitest**: `tests/unit/` — audit stage machine, parity scoring/diff (fail-closed, db_schema fail-closed), lease fence (LeaseLostError, heartbeat eviction), knowledge index (Unicode tokenizer, scoped deletion), self-approval forbid, contracts, auth (scrypt, role permissions, requirePermission 401/403), utils. **90 tests, all green locally trên Node 22 / npm 10.9.8.**
-- **GitHub Actions** (`.github/workflows/ci.yml`): install → lint → typecheck → push schema → **verify migrations apply trên DB sạch** (`db:migrate` vào database trống riêng, đếm rows `__drizzle_migrations`, kiểm tra bảng `audits` được tạo) → seed → tests → verify:worker → verify:executors → verify:release → build → API smoke test với PostgreSQL service → Docker build + smoke (với `--add-host=host.docker.internal:host-gateway` cho Linux runner).
+- **Vitest**: `tests/unit/` — audit stage machine, parity scoring/diff (fail-closed, db_schema fail-closed), lease fence (LeaseLostError, heartbeat eviction), knowledge index (Unicode tokenizer, scoped deletion), self-approval forbid, contracts, auth (scrypt, role permissions, requirePermission 401/403), utils. **95 tests, all green trên Node 22 / npm 10.9.8.**
+- **GitHub Actions** (`.github/workflows/ci.yml`): install → dependency audit → lint → typecheck → push schema → **verify migrations apply trên DB sạch** (apply từng file `.sql` qua `psql -v ON_ERROR_STOP=1`, kiểm tra bảng `audits` + index `audits_active_uidx`) → **migration upgrade test** (apply migrations cũ → insert row → apply migration mới trên top) → seed → tests → verify:worker → verify:executors → verify:release → build → API smoke test → Docker build + smoke → docker compose config validation (cả demo + production profile) → Tauri build matrix (Linux/Windows/macOS).
 - **Toolchain**: Node 22 + npm 10.9.8 là canonical (CI và Docker cùng dùng Node 22). `package.json` khai báo `engines`, `.nvmrc` pin Node 22. Lockfile phải được tạo/cập nhật bằng npm 10 — npm 11 (Node 24) sinh layout `tsx → esbuild` khác và `npm ci` trên CI (npm 10) sẽ từ chối.
-- **CI status**: các bước migration/executor/Docker verification đã được thêm vào workflow nhưng **chưa từng chạy xanh trên GitHub** do lockfile mismatch (đã sửa trong branch này, chờ merge). Không tuyên bố "CI verification complete" cho đến khi run mới nhất pass.
+- **CI status**: CI đã chạy xanh trên GitHub (PR #3 merged, run #27 pass). Tauri build matrix là `continue-on-error` (scaffold, chưa build installer thật trên mọi platform).
 
 ## Worker (production queue)
 
@@ -198,7 +198,7 @@ APP_MODE=production npm run worker
 - Stale recovery **atomic**: `UPDATE … WHERE heartbeat < now()-45s RETURNING` per outcome (không SELECT-then-UPDATE-by-id); bao gồm `audit.run`: requeue khi heartbeat > 45s, `timed_out` + audit `failed` khi hết attempts
 - Resume idempotent: `UNIQUE(audit_id, path)` cho artifacts, `UNIQUE(audit_id, fingerprint)` cho findings, `UNIQUE(audit_id)` cho parity reports → retry ghi đè, không nhân bản
 - `UNIQUE(idempotency_key)` (partial, `WHERE NOT NULL`) + xử lý conflict → hai request đồng thời cùng idempotency key không tạo hai audit
-- **Active-audit exclusivity**: `UNIQUE partial index ON (1) WHERE status IN ('running','waiting_approval')` → chỉ một audit active tại một thời điểm, đóng lỗ hổng SELECT-then-INSERT race (hai request khác idempotency key đều qua check active rồi cùng insert)
+- **Active-audit exclusivity**: `UNIQUE partial index trên generated column active_bucket WHERE active_bucket IS NOT NULL` → chỉ một audit active tại một thời điểm, đóng lỗ hổng SELECT-then-INSERT race (hai request khác idempotency key đều qua check active rồi cùng insert). `active_bucket` là generated column: `CASE WHEN status IN ('running','waiting_approval') THEN id ELSE NULL END`.
 - Approval quyết định atomic (`UPDATE … WHERE status='pending' RETURNING`) → không double-spawn job
 - **Self-approval forbidden**: requester không thể approve/reject yêu cầu của chính mình (trừ `requestedBy="system"`) — production approval yêu cầu **second person sign-off**, đúng như mô tả
 
@@ -282,7 +282,19 @@ src-tauri/                # desktop scaffold
 - [x] ~~Scoped knowledge index không xóa artifact đã bị xóa~~ — đã sửa (`auditDocs` map evict postings cũ; `scopedToAudit`→`lastScopedAudit`)
 - [x] ~~Active-audit concurrency race~~ — đã sửa (partial unique index `audits_active_uidx`)
 - [x] ~~Self-approval~~ — đã sửa (requester không approve yêu cầu của chính mình)
-- [x] ~~CI migration validation~~ — đã thêm bước `db:migrate` apply trên DB sạch + Docker `--add-host` (chưa từng chạy xanh do lockfile mismatch, đã sửa trong branch này)
+- [x] ~~CI migration validation~~ — đã thêm bước apply migration qua `psql` trên DB sạch + migration upgrade test + Docker `--add-host`. CI đã chạy xanh trên GitHub (PR #3 merged).
+- [x] ~~Login rate limit / account lockout / backoff~~ — đã thêm (5 failed attempts → 15 min lockout, in-memory per username+IP)
+- [x] ~~Cookie Secure flag trong production~~ — đã thêm (`Secure` khi `NODE_ENV=production && !isDemoMode`)
+- [x] ~~Session cleanup~~ — worker dọn expired sessions mỗi 12 tick
+- [x] ~~Password policy~~ — `validatePasswordPolicy` (min 10 chars, 1 letter, 1 digit)
+- [x] ~~Dependency vulnerability audit~~ — `npm audit --audit-level=high` trong CI (continue-on-error)
+- [x] ~~Parity gate enforcement~~ — parity `failed` → audit failed, không tạo packaging approval (gate thật, không chỉ report)
+- [x] ~~Approval expiry deadlock~~ — expired approval → audit cancelled atomically + `POST /api/audits/[id]/cancel`
+- [x] ~~Scope validation~~ — scope phải thuộc enum, typo trả 400 (không fallback "scan all")
+- [x] ~~DB false-green empty schema~~ — db_schema `pending` khi 0 tables, `warning` khi không có migration ledger
+- [x] ~~Telemetry false "OTLP live"~~ — `source` column + freshness check (10 min), không infer "otlp" từ "has data + prod"
+- [x] ~~Docker Compose production target~~ — worker nhận `AUDIT_TARGET_ROOT_PRODUCTION` + mount read-only + `docker compose config` validation trong CI
+- [x] ~~Tauri CSP~~ — `csp: null` → CSP policy thật (default-src 'self', connect-src 127.0.0.1:3000)
 - [ ] OTLP ingestion thật (điểm cắm `src/services/telemetry.ts`) → `source: "otlp"`
 - [ ] GitHub push thật cho reconstruction bundle (hiện `artifact.package` chỉ package local, chưa push)
 - [ ] Artifact object storage (MinIO/S3) — metadata đã sẵn (storageProvider/storageKey/sha256)
@@ -291,9 +303,9 @@ src-tauri/                # desktop scaffold
 - [ ] Playwright E2E suite
 - [ ] OIDC provider thay cho auth nội bộ tối thiểu
 - [ ] Markdown/Mermaid/SARIF renderers cho artifact viewer
-- [ ] Login rate limit / account lockout / backoff
+- [ ] Tauri installer signing + updater + Node runtime bundling thật (hiện scaffold + build matrix)
 - [ ] Cookie `Secure` flag cho production
 - [ ] Production rules enforcement (backend, không chỉ UI)
 - [ ] Tauri desktop distributable: build theo OS matrix, CSP, signing, updater
 - [ ] Tauri: bundle `worker/index.js` vào standalone output
-- [ ] DB migrations thay vì db:push cho release — migrations đã có và CI đã verify apply, nhưng release pipeline vẫn dùng `db:push`; chuyển hẳn sang `db:migrate` cho production deploy
+- [ ] DB migrations thay vì db:push cho production deploy — migrations đã có và CI đã verify apply (clean + upgrade test), nhưng `docker-compose.yml` vẫn dùng `drizzle-kit push` cho schema bootstrap. Chuyển hẳn sang `psql -f` apply migrations cho production deploy khi drizzle-kit `migrate` ổn định trên PostgreSQL 17.

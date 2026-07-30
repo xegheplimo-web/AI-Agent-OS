@@ -81,6 +81,12 @@ async function main() {
            approval permanently blocks new audits. */
         const expired = await expireStaleApprovals();
         if (expired) console.log(`[worker] expired ${expired} stale approval(s)`);
+        /* Clean up expired sessions so the sessions table doesn't grow
+           unbounded. */
+        const { db: dbMod } = await import("../db");
+        const { sessions } = await import("../db/schema");
+        const { lt } = await import("drizzle-orm");
+        await dbMod.delete(sessions).where(lt(sessions.expiresAt, new Date()));
       }
       /* Synthetic random-walk telemetry is a DEMO affordance only. Running it
          in production would seed the database with fabricated metrics that

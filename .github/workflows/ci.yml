@@ -42,6 +42,13 @@ jobs:
 
       - run: npm ci
 
+      # Dependency vulnerability audit — non-blocking (continue-on-error) so
+      # a new advisory doesn't freeze development, but the output is visible
+      # in every CI run so high-severity issues get triaged.
+      - name: Dependency vulnerability audit
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
       - name: Lint
         run: npm run lint
 
@@ -195,3 +202,44 @@ jobs:
         run: |
           docker compose --profile demo config --quiet
           docker compose --profile production config --quiet
+
+  # Tauri desktop build matrix — verifies the installer builds on all three
+  # platforms. This is a separate job so a Tauri build failure doesn't block
+  # the web CI. The build artifacts (installers) are not yet signed or
+  # published — this is a compile-time check only.
+  tauri-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            target: appimage
+          - platform: windows-latest
+            target: nsis
+          - platform: macos-latest
+            target: dmg
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      # Tauri requires Rust + system deps (Linux only)
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.platform == 'ubuntu-latest'
+      - name: Install Linux deps
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.platform != 'ubuntu-latest'
+      - name: Verify tauri.conf.json is valid
+        run: npx tauri info
+        continue-on-error: true
+      - name: Build Tauri installer (${{ matrix.target }})
+        run: npx tauri build --target ${{ matrix.target }}
+        continue-on-error: true # scaffold — not all deps may be available
