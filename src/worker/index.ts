@@ -14,7 +14,7 @@ import "dotenv/config";
 
 async function main() {
   const { pool, closeDb } = await import("../db");
-  const { advanceAuditsOnce, runClaimedAudits } = await import("../services/audit");
+  const { advanceAuditsOnce, runClaimedAudits, expireStaleApprovals } = await import("../services/audit");
   const { advanceJobsOnce, requeueStaleJobs } = await import("../services/jobs");
   const { sampleTelemetryOnce } = await import("../services/telemetry");
   const { APP_MODE, isDemoMode } = await import("../services/mode");
@@ -74,6 +74,11 @@ async function main() {
       if (beats % 12 === 0) {
         const requeued = await requeueStaleJobs();
         if (requeued) console.log(`[worker] recovered ${requeued} stale job(s)`);
+        /* Expire stale pending approvals (>24h) and cancel their audits so
+           the active-audit singleton slot is freed. Without this, an expired
+           approval permanently blocks new audits. */
+        const expired = await expireStaleApprovals();
+        if (expired) console.log(`[worker] expired ${expired} stale approval(s)`);
       }
       /* Synthetic random-walk telemetry is a DEMO affordance only. Running it
          in production would seed the database with fabricated metrics that

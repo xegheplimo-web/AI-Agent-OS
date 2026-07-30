@@ -159,3 +159,16 @@ jobs:
           done
           curl -sf http://localhost:3001/api/health > /dev/null
           docker stop aos-ci && docker rm aos-ci
+
+      # Verify docker-compose.yml parses for both profiles. Catches YAML
+      # interpolation errors (e.g. unquoted colons in error messages) and
+      # missing required env vars before they bite a real deployment.
+      - name: Verify docker compose config (both profiles)
+        env:
+          API_INTERNAL_TOKEN: ci-internal-token
+          SESSION_SECRET: ci-session-secret
+          AUDITOR_SERVICE_TOKEN: ci-auditor-token
+          WORKER_SERVICE_TOKEN: ci-worker-token
+        run: |
+          docker compose --profile demo config --quiet
+          docker compose --profile production config --quiet

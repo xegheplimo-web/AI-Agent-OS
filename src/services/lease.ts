@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { jobs } from "@/db/schema";
 
@@ -32,6 +32,11 @@ export interface LeaseFence {
   /** Throws LeaseLostError if the lease is gone (background flag OR explicit
    *  DB check). Call this before each major side-effect group. */
   assert: () => Promise<void>;
+  /** Atomically update the job row only if the lease token still matches.
+   *  Returns the updated row count (0 = lease lost). Use this inside a
+   *  transaction to make the check + write atomic — no race window between
+   *  assert() and the actual write. */
+  fencedJobUpdate: (set: Record<string, unknown>) => Promise<number>;
   /** Stop the background heartbeat timer. */
   stop: () => void;
 }
@@ -48,6 +53,10 @@ export function createLeaseFence(jobId: string | undefined, leaseToken: string |
       leaseToken: null,
       leaseLost: () => false,
       assert: async () => {},
+      fencedJobUpdate: async (set: Record<string, unknown>) => {
+        const res = await db.update(jobs).set(set).where(eq(jobs.id, jobId ?? "")).returning({ id: jobs.id });
+        return res.length;
+      },
       stop: () => {},
     };
   }
@@ -76,6 +85,23 @@ export function createLeaseFence(jobId: string | undefined, leaseToken: string |
          the lease may have been cleared by a concurrent requeue. */
       const rows = await db.select({ leaseToken: jobs.leaseToken }).from(jobs).where(eq(jobs.id, jobId)).limit(1);
       if (!rows.length || rows[0].leaseToken !== leaseToken) throw new LeaseLostError();
+    },
+    /* Atomic lease-gated update: the WHERE clause includes lease_token = $token,
+       so if the stale supervisor cleared it, 0 rows match and we know the lease
+       is lost — no race window between a separate assert() and the write. */
+    fencedJobUpdate: async (set: Record<string, unknown>) => {
+      if (!leaseToken) {
+        /* No lease token (demo/inline) — unconditional update. */
+        const res = await db.update(jobs).set(set).where(eq(jobs.id, jobId)).returning({ id: jobs.id });
+        return res.length;
+      }
+      const res = await db
+        .update(jobs)
+        .set(set)
+        .where(and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken)))
+        .returning({ id: jobs.id });
+      if (!res.length) throw new LeaseLostError();
+      return res.length;
     },
     stop: () => clearInterval(timer),
   };

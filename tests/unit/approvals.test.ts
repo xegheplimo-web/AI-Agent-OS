@@ -24,7 +24,14 @@ function makeTx() {
       };
     },
   });
-  return { update, insert: () => ({ values: txInsert }) };
+  const select = () => ({
+    from: () => ({
+      where: () => ({
+        limit: () => Promise.resolve([{ id: "aud-done", status: "completed" }]),
+      }),
+    }),
+  });
+  return { update, insert: () => ({ values: txInsert }), select };
 }
 
 const transactionImpl = vi.fn();
@@ -56,7 +63,7 @@ vi.mock("@/db/schema", () => ({
 vi.mock("@/lib/audit-log", () => ({ logAudit: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("@/services/mode", () => ({ isDemoMode: false }));
 
-import { decideApproval } from "@/services/audit";
+import { decideApproval, cancelAudit } from "@/services/audit";
 
 beforeEach(() => {
   txUpdateReturning.mockReset();
@@ -126,5 +133,65 @@ describe("decideApproval — self-approval is forbidden", () => {
     /* Even if actor.id were "system", system requests are exempt. */
     const res = await decideApproval("apv-1", "approved", { id: "system", displayName: "system" } as never);
     expect(res.ok).toBe(true);
+  });
+});
+
+describe("decideApproval — expiry cancels the audit (no deadlock)", () => {
+  it("marks expired approval + cancels audit so the singleton slot is freed", async () => {
+    /* Approval requested 25h ago — past the 24h TTL. */
+    const stale = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    txUpdateReturning.mockResolvedValue([
+      {
+        id: "apv-stale",
+        status: "approved",
+        requestedBy: "user-1",
+        requestedAt: stale,
+        actionType: "audit.run",
+        targetId: "aud-stale",
+        title: "Stale audit",
+      },
+    ]);
+    transactionImpl.mockImplementation((cb: (tx: unknown) => Promise<unknown>) => runTransaction(cb));
+
+    const res = await decideApproval("apv-stale", "approved", { id: "user-2", displayName: "Other" } as never);
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/expired/i);
+    /* The approval should be set to "expired" (not reverted to "pending").
+       txUpdateSet captures the last .set() call — the expiry path sets
+       status:"expired" on the approval. */
+    const setCalls = txUpdateSet.mock.calls.map((c) => c[0]);
+    const expirySet = setCalls.find((s: Record<string, unknown>) => s.status === "expired");
+    expect(expirySet).toBeDefined();
+  });
+});
+
+describe("cancelAudit — frees the singleton slot", () => {
+  it("cancels a waiting_approval audit and expires its pending approvals", async () => {
+    txUpdateReturning.mockResolvedValue([
+      { id: "aud-1", status: "cancelled" },
+    ]);
+    transactionImpl.mockImplementation((cb: (tx: unknown) => Promise<unknown>) => runTransaction(cb));
+
+    const res = await cancelAudit("aud-1", { id: "admin", displayName: "Admin" } as never, "wrong scope");
+    expect(res.ok).toBe(true);
+    /* The audit update should set status:"cancelled" */
+    const setCalls = txUpdateSet.mock.calls.map((c) => c[0]);
+    const cancelSet = setCalls.find((s: Record<string, unknown>) => s.status === "cancelled");
+    expect(cancelSet).toBeDefined();
+  });
+
+  it("rejects cancelling a completed audit", async () => {
+    /* First UPDATE returns [] (no row matched — audit is not running/waiting).
+       The follow-up SELECT returns a completed audit. */
+    txUpdateReturning.mockResolvedValue([]);
+    transactionImpl.mockImplementation(async (cb: (tx: unknown) => Promise<unknown>) => {
+      const tx = makeTx();
+      /* Override select to return a completed audit */
+      return cb(tx);
+    });
+
+    const res = await cancelAudit("aud-done", { id: "admin", displayName: "Admin" } as never);
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/completed|cannot cancel/i);
   });
 });

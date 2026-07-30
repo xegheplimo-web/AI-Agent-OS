@@ -165,6 +165,7 @@ export async function scanFilesystem(target?: AuditTarget): Promise<ScanResult> 
 export async function scanPackages(target?: AuditTarget): Promise<ScanResult> {
   const scan = startScan("package-inventory");
   try {
+    if (target && !target.rootValid) return scan.fail(target.rootInvalidReason ?? `invalid target root`);
     const root = target?.root ?? LEGACY_ROOT;
     const pkgRaw = await readFile(path.join(root, "package.json"), "utf-8");
     const pkg = JSON.parse(pkgRaw) as {
@@ -336,6 +337,7 @@ const SECRET_ALLOWLIST = [/\.env\.example$/, /README\.md$/, /scanners\.ts$/, /se
 export async function scanSecrets(target?: AuditTarget): Promise<ScanResult> {
   const scan = startScan("secret-scan");
   try {
+    if (target && !target.rootValid) return scan.fail(target.rootInvalidReason ?? `invalid target root`);
     const root = target?.root ?? LEGACY_ROOT;
     const files: FileEntry[] = [];
     await walk(path.join(root, "src"), files, 0, root);
@@ -517,6 +519,7 @@ export async function scanDatabase(target?: AuditTarget): Promise<ScanResult> {
 export async function scanRuntime(target?: AuditTarget): Promise<ScanResult> {
   const scan = startScan("runtime-inventory");
   try {
+    if (target && !target.rootValid) return scan.fail(target.rootInvalidReason ?? `invalid target root`);
     const root = target?.root ?? LEGACY_ROOT;
     const runtimeEndpoint = target?.runtimeEndpoint ?? null;
 

@@ -1,4 +1,4 @@
-import { desc, eq, sql } from "drizzle-orm";
+import { desc, eq, sql, and } from "drizzle-orm";
 import { db } from "@/db";
 import { events, telemetryPoints } from "@/db/schema";
 import { ensureEventFreshIfDemo } from "@/services/audit";
@@ -9,6 +9,11 @@ import { requirePermission } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
+/* Data older than this is considered stale — not "live". 10 minutes is
+   generous for a 5-min scrape interval; anything older means the collector
+   stopped or was never configured. */
+const FRESHNESS_MS = 10 * 60 * 1000;
+
 async function seriesOf(metric: string, limit = 30) {
   const rows = await db
     .select()
@@ -16,7 +21,7 @@ async function seriesOf(metric: string, limit = 30) {
     .where(eq(telemetryPoints.metric, metric))
     .orderBy(desc(telemetryPoints.ts))
     .limit(limit);
-  return rows.reverse().map((r) => ({ ts: r.ts.toISOString(), value: r.value }));
+  return rows.reverse().map((r) => ({ ts: r.ts.toISOString(), value: r.value, source: r.source }));
 }
 
 export async function GET(req: Request) {
@@ -41,17 +46,38 @@ export async function GET(req: Request) {
 
   const hasData = p95.length > 0 || p50.length > 0 || thr.length > 0 || err.length > 0 || queueRows.length > 0;
 
-  /* Provenance:
-   *   demo + data  → "synthetic"  (the random-walk sampler wrote the rows)
-   *   prod + data  → "otlp"       (only a real collector could have written
-   *                                them — there is no production sampler)
-   *   no data      → "unavailable" (honest absence; never fabricate a fallback)
-   *
-   * The previous implementation returned hardcoded fallbacks (128/54/1284/
-   * 0.22/23) and a synthetic radar when no rows existed, so a production
-   * deployment with no collector displayed realistic-looking numbers with no
-   * warning — false provenance. */
-  const source: TelemetrySource = !hasData ? "unavailable" : isDemoMode ? "synthetic" : "otlp";
+  /* Provenance is determined by the `source` column on the telemetry rows,
+     NOT inferred from "has data + production mode". The previous logic
+     falsely labeled seed/demo data as "otlp" because it assumed only a real
+     collector could write rows in production — but seed.ts inserts
+     latency_p95=128ms in every environment, so a fresh production deploy
+     with no collector showed "OTLP live" on synthetic data.
+
+     Resolution:
+       no data                    → "unavailable" (honest absence)
+       any row source="synthetic" → "synthetic" (demo sampler, never prod)
+       any row source="otlp"      → "otlp" (real collector — not yet wired)
+       all rows source="manual"   → "manual" (seed or manual insert)
+       data but all stale (>10m)  → "stale" (collector stopped or never set up)
+
+     The freshest row's source wins — a mix means the collector started
+     after seed data was loaded. */
+  const allRows = [...p95, ...p50, ...thr, ...err, ...queueRows.map((r) => ({ ts: r.ts.toISOString(), value: r.value, source: r.source }))];
+  const freshest = allRows.sort((a, b) => b.ts.localeCompare(a.ts))[0];
+  const freshestAge = freshest ? Date.now() - new Date(freshest.ts).getTime() : Infinity;
+
+  let source: TelemetrySource;
+  if (!hasData) {
+    source = "unavailable";
+  } else if (freshestAge > FRESHNESS_MS) {
+    source = "stale";
+  } else if (freshest?.source === "otlp") {
+    source = "otlp";
+  } else if (freshest?.source === "synthetic") {
+    source = "synthetic";
+  } else {
+    source = "manual";
+  }
 
   const last = (arr: Array<{ value: number }>): number | null => (arr.length ? arr[arr.length - 1].value : null);
 

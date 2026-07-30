@@ -329,12 +329,26 @@ export async function decideApproval(
 
       /* Expiry check — the UPDATE matched, but was it stale? */
       if (new Date(approval.requestedAt) < cutoff) {
-        /* Revert the decision — the approval was too old to act on. */
+        /* An expired approval cannot be decided (approve or reject). Mark it
+           expired (not pending) so it can't be retried, and cancel the audit
+           it gates so the active-audit singleton index is freed. Previously
+           this reverted to "pending" but left the audit in waiting_approval
+           forever — no endpoint could cancel it, and the unique index blocked
+           every new audit. Now the audit is cancelled atomically. */
         await tx
           .update(approvals)
-          .set({ status: "pending", decidedBy: null, decidedAt: null, reason: null })
+          .set({ status: "expired", decidedBy: null, decidedAt: new Date(), reason: "auto-expired (>24h)" })
           .where(eq(approvals.id, approvalId));
-        return { ok: false as const, error: "Approval expired (>24h) — request a new one" };
+        if (approval.actionType === "audit.run" && approval.targetId) {
+          await tx.update(audits).set({ status: "cancelled", finishedAt: new Date() }).where(eq(audits.id, approval.targetId));
+        }
+        await tx.insert(events).values({
+          type: "approval.expired",
+          severity: "warning",
+          source: "system",
+          message: `Approval ${approvalId.slice(0, 8)} expired (>24h) — audit cancelled`,
+        });
+        return { ok: false as const, error: "Approval expired (>24h) — audit has been cancelled; start a new audit to retry" };
       }
 
       if (decision === "rejected") {
@@ -431,6 +445,109 @@ export async function decideApproval(
       ok: false,
       error: `Approval decision failed (rolled back, still pending): ${err instanceof Error ? err.message : String(err)}`,
     };
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Cancel an audit — frees the active-audit singleton slot.            */
+/* ------------------------------------------------------------------ */
+export async function cancelAudit(
+  auditId: string,
+  actor: Actor,
+  reason?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const result = await db.transaction(async (tx) => {
+      /* Only running or waiting_approval audits can be cancelled. A completed
+         or already-cancelled audit is immutable. The WHERE clause makes the
+         check + update atomic. */
+      const cancelled = await tx
+        .update(audits)
+        .set({ status: "cancelled", finishedAt: new Date() })
+        .where(and(eq(audits.id, auditId), inArray(audits.status, ["running", "waiting_approval"])))
+        .returning();
+
+      if (!cancelled.length) {
+        const [existing] = await tx.select().from(audits).where(eq(audits.id, auditId)).limit(1);
+        return {
+          ok: false as const,
+          error: existing ? `Audit is ${existing.status} — cannot cancel` : "Audit not found",
+        };
+      }
+
+      /* Cancel any pending approvals for this audit so they can't be decided
+         later (which would try to start a cancelled audit). */
+      await tx
+        .update(approvals)
+        .set({ status: "expired", decidedAt: new Date(), reason: `audit cancelled by ${actor.displayName}` })
+        .where(and(eq(approvals.targetId, auditId), eq(approvals.status, "pending")));
+
+      /* Requeue or cancel the active job so the worker doesn't keep running. */
+      await tx
+        .update(jobs)
+        .set({ status: "cancelled", finishedAt: new Date(), errorCode: "AUDIT_CANCELLED", errorMessage: "audit cancelled by operator" })
+        .where(and(eq(jobs.auditId, auditId), inArray(jobs.status, ["queued", "running"])));
+
+      await tx.insert(events).values({
+        type: "audit.cancelled",
+        severity: "warning",
+        source: actor.id,
+        message: `Audit ${auditId.slice(0, 8)} cancelled by ${actor.displayName}${reason ? ` — ${reason}` : ""}`,
+      });
+
+      return { ok: true as const };
+    });
+
+    if (!result.ok) return result;
+
+    await logAudit({
+      actor,
+      action: "audit.cancel",
+      resourceType: "audit",
+      resourceId: auditId,
+      detail: { reason },
+    });
+
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `Cancel failed (rolled back): ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+/* Expire stale pending approvals and cancel their audits. Called by the
+   supervisor/cron to prevent the approval-expiry deadlock from accumulating.
+   Returns the number of approvals expired. */
+export async function expireStaleApprovals(): Promise<number> {
+  const APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
+  const cutoff = new Date(Date.now() - APPROVAL_TTL_MS);
+
+  try {
+    const expired = await db.transaction(async (tx) => {
+      const stale = await tx
+        .update(approvals)
+        .set({ status: "expired", decidedAt: new Date(), reason: "auto-expired (>24h)" })
+        .where(and(eq(approvals.status, "pending"), sql`${approvals.requestedAt} < ${cutoff}`))
+        .returning();
+
+      for (const a of stale) {
+        if (a.actionType === "audit.run" && a.targetId) {
+          await tx.update(audits).set({ status: "cancelled", finishedAt: new Date() }).where(eq(audits.id, a.targetId));
+        }
+        await tx.insert(events).values({
+          type: "approval.expired",
+          severity: "warning",
+          source: "system",
+          message: `Approval ${a.id.slice(0, 8)} auto-expired (>24h) — audit cancelled`,
+        });
+      }
+      return stale.length;
+    });
+    return expired;
+  } catch {
+    return 0;
   }
 }
 

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { artifacts, audits, events, jobs, parityReports, settings, telemetryPoints } from "@/db/schema";
 import { computeParityScore } from "@/lib/parity";
@@ -8,6 +8,7 @@ import { DISCOVERY_SCANNERS, scannersForTarget, scanPackages } from "@/services/
 import { normalize, parityChecksFrom } from "@/services/auditor/normalize";
 import { buildInventoryJson, buildRealSbom } from "@/services/auditor/reconstruct";
 import { resolveTarget, targetProvenance } from "@/services/auditor/target";
+import { isDemoMode } from "@/services/mode";
 import type { LeaseFence } from "@/services/lease";
 import type { JobRow } from "@/db/schema";
 
@@ -121,6 +122,11 @@ export async function executeSbomExport(job: JobRow, lease?: LeaseFence): Promis
   const auditScope = job.auditId ? (await loadAuditScope(job.auditId)) : [];
   const target = resolveTarget(environment, auditScope);
 
+  /* Fail-closed: if the target root is invalid (e.g. production root not
+     configured), the SBOM would be built from the worker's own checkout —
+     a false-green. Abort instead. */
+  if (!target.rootValid) throw new Error(`SBOM export refused: ${target.rootInvalidReason ?? "invalid target root"}`);
+
   /* Run only the package-inventory scanner — cheaper than a full discovery
      pass and it is the only one feeding the SBOM. */
   const pkgResult = await scanPackages(target);
@@ -167,11 +173,20 @@ export async function executeParityGate(job: JobRow, lease?: LeaseFence): Promis
   }
   const inv = normalize(results);
 
-  /* p95 latency from telemetry — null when absent (no false-green). */
+  /* p95 latency from telemetry — null when absent or stale (no false-green).
+     Only "otlp" or "manual" sources count for production parity; "synthetic"
+     (demo sampler) data must not make a production parity gate pass. Data
+     older than 10 minutes is treated as absent — the collector stopped. */
+  const FRESHNESS_MS = 10 * 60 * 1000;
+  const cutoff = new Date(Date.now() - FRESHNESS_MS);
   const p95Rows = await db
     .select()
     .from(telemetryPoints)
-    .where(eq(telemetryPoints.metric, "latency_p95"))
+    .where(and(
+      eq(telemetryPoints.metric, "latency_p95"),
+      sql`${telemetryPoints.ts} > ${cutoff}`,
+      inArray(telemetryPoints.source, isDemoMode ? ["synthetic", "manual"] : ["otlp"]),
+    ))
     .orderBy(desc(telemetryPoints.ts))
     .limit(1);
   const latencyP95: number | null = p95Rows.length ? p95Rows[0].value : null;

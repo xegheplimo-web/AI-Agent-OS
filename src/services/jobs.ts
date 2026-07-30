@@ -1,4 +1,4 @@
-import { and, desc, eq, or } from "drizzle-orm";
+import { and, desc, eq, or, sql } from "drizzle-orm";
 import { db, pool } from "@/db";
 import { audits, events, jobs } from "@/db/schema";
 import type { Actor } from "@/lib/auth";
@@ -231,71 +231,85 @@ export async function advanceJobsOnce(workerId?: string): Promise<void> {
 const STALE_INTERVAL_MS = 45_000;
 
 export async function requeueStaleJobs(): Promise<number> {
-  /* --- exhausted attempts → terminal `timed_out` --- */
-  const timedOut = await pool.query(
-    `UPDATE jobs
-        SET status='timed_out',
-            finished_at=now(),
-            error_code='HEARTBEAT_LOST',
-            error_message='Worker heartbeat lost after '
-              || round(extract(epoch from (now() - coalesce(heartbeat_at, created_at)))::numeric)
-              || 's',
-            lease_token=NULL,
-            updated_at=now()
-      WHERE status='running'
-        AND locked_by IS DISTINCT FROM 'inline-demo'
-        AND coalesce(heartbeat_at, created_at) < now() - ($1 || ' seconds')::interval
-        AND attempt >= max_attempts
-      RETURNING id, type, target, audit_id`,
-    [String(STALE_INTERVAL_MS / 1000)],
-  );
+  /* The job update + audit update + event insert are wrapped in a single
+     transaction so a stale supervisor cannot leave the job requeued but the
+     audit still "running" (or vice versa). Previously these were separate
+     statements — a crash between them could leave the audit stuck running
+     with a requeued job, or a new worker could complete the audit while the
+     old supervisor was still writing the audit back to "running". */
+  try {
+    return await db.transaction(async (tx) => {
+      /* --- exhausted attempts → terminal `timed_out` --- */
+      const timedOut = await tx.execute(
+        sql`UPDATE jobs
+               SET status='timed_out',
+                   finished_at=now(),
+                   error_code='HEARTBEAT_LOST',
+                   error_message='Worker heartbeat lost after '
+                     || round(extract(epoch from (now() - coalesce(heartbeat_at, created_at)))::numeric)
+                     || 's',
+                   lease_token=NULL,
+                   updated_at=now()
+             WHERE status='running'
+               AND locked_by IS DISTINCT FROM 'inline-demo'
+               AND coalesce(heartbeat_at, created_at) < now() - (${sql.raw(String(STALE_INTERVAL_MS / 1000))} || ' seconds')::interval
+               AND attempt >= max_attempts
+             RETURNING id, type, target, audit_id`,
+      );
 
-  /* --- attempts remain → back to `queued` for another worker --- */
-  const requeued = await pool.query(
-    `UPDATE jobs
-        SET status='queued', locked_by=NULL, worker=NULL, lease_token=NULL, progress=0, updated_at=now()
-      WHERE status='running'
-        AND locked_by IS DISTINCT FROM 'inline-demo'
-        AND coalesce(heartbeat_at, created_at) < now() - ($1 || ' seconds')::interval
-        AND attempt < max_attempts
-      RETURNING id, type, target, audit_id`,
-    [String(STALE_INTERVAL_MS / 1000)],
-  );
+      /* --- attempts remain → back to `queued` for another worker --- */
+      const requeued = await tx.execute(
+        sql`UPDATE jobs
+               SET status='queued', locked_by=NULL, worker=NULL, lease_token=NULL, progress=0, updated_at=now()
+             WHERE status='running'
+               AND locked_by IS DISTINCT FROM 'inline-demo'
+               AND coalesce(heartbeat_at, created_at) < now() - (${sql.raw(String(STALE_INTERVAL_MS / 1000))} || ' seconds')::interval
+               AND attempt < max_attempts
+             RETURNING id, type, target, audit_id`,
+      );
 
-  let recovered = 0;
-  for (const row of timedOut.rows as Array<{ type: string; target: string; audit_id: string | null }>) {
-    if (row.type === "audit.run" && row.audit_id) {
-      await db
-        .update(audits)
-        .set({ status: "failed", finishedAt: new Date() })
-        .where(and(eq(audits.id, row.audit_id), eq(audits.status, "running")));
-    }
-    await db.insert(events).values({
-      type: "job.requeued",
-      severity: "warning",
-      source: "worker-supervisor",
-      message: `${row.type} (${row.target}) timed out — heartbeat lost`,
+      let recovered = 0;
+      const timedOutRows = (timedOut.rows ?? []) as Array<{ type: string; target: string; audit_id: string | null }>;
+      for (const row of timedOutRows) {
+        if (row.type === "audit.run" && row.audit_id) {
+          await tx
+            .update(audits)
+            .set({ status: "failed", finishedAt: new Date() })
+            .where(and(eq(audits.id, row.audit_id), eq(audits.status, "running")));
+        }
+        await tx.insert(events).values({
+          type: "job.requeued",
+          severity: "warning",
+          source: "worker-supervisor",
+          message: `${row.type} (${row.target}) timed out — heartbeat lost`,
+        });
+        recovered += 1;
+      }
+      const requeuedRows = (requeued.rows ?? []) as Array<{ type: string; target: string; audit_id: string | null }>;
+      for (const row of requeuedRows) {
+        /* keep the audit runnable so the next claimer resumes it (upserts make
+           the partial work from the dead worker safe to rewrite) */
+        if (row.type === "audit.run" && row.audit_id) {
+          await tx
+            .update(audits)
+            .set({ status: "running", finishedAt: null })
+            .where(eq(audits.id, row.audit_id));
+        }
+        await tx.insert(events).values({
+          type: "job.requeued",
+          severity: "warning",
+          source: "worker-supervisor",
+          message: `${row.type} (${row.target}) requeued — heartbeat lost`,
+        });
+        recovered += 1;
+      }
+      return recovered;
     });
-    recovered += 1;
+  } catch (err) {
+    /* Transaction failed — nothing was committed, no partial state. */
+    console.error("[jobs] requeueStaleJobs transaction failed:", err);
+    return 0;
   }
-  for (const row of requeued.rows as Array<{ type: string; target: string; audit_id: string | null }>) {
-    /* keep the audit runnable so the next claimer resumes it (upserts make
-       the partial work from the dead worker safe to rewrite) */
-    if (row.type === "audit.run" && row.audit_id) {
-      await db
-        .update(audits)
-        .set({ status: "running", finishedAt: null })
-        .where(eq(audits.id, row.audit_id));
-    }
-    await db.insert(events).values({
-      type: "job.requeued",
-      severity: "warning",
-      source: "worker-supervisor",
-      message: `${row.type} (${row.target}) requeued — heartbeat lost`,
-    });
-    recovered += 1;
-  }
-  return recovered;
 }
 
 export async function advanceJobsIfDemo(): Promise<void> {

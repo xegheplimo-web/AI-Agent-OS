@@ -570,6 +570,19 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
     const message = err instanceof Error ? err.message : String(err);
     const idx = stages.findIndex((s) => s.status === "active");
     if (idx >= 0) stages[idx].status = "failed";
+
+    /* Lease-fence the audit failure update: if the stale supervisor already
+       requeued the job and a new worker claimed it, our error-path write
+       must NOT clobber the new owner's audit state. We check the job's
+       lease_token first — if it doesn't match, the audit is no longer ours. */
+    if (leaseToken && jobId) {
+      const [currentJob] = await db.select({ leaseToken: jobs.leaseToken }).from(jobs).where(eq(jobs.id, jobId)).limit(1);
+      if (!currentJob || currentJob.leaseToken !== leaseToken) {
+        /* Lease lost during error path — another worker owns the audit now.
+           Do not write audit/job/event state. */
+        return;
+      }
+    }
     await db
       .update(audits)
       .set({ status: "failed", finishedAt: new Date(), stages })
