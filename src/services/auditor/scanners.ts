@@ -205,47 +205,86 @@ export async function scanPackages(target?: AuditTarget): Promise<ScanResult> {
       });
     }
 
-    /* ---- transitive dependencies: walk node_modules for installed pkgs ---- */
+    /* ---- transitive dependencies: walk node_modules for installed pkgs ----
+       If node_modules is absent (e.g. auditing a repo checkout without
+       `npm install`), fall back to package-lock.json which contains the
+       full resolved dependency tree with versions and licenses. This
+       ensures SBOM coverage even when the target has no installed deps. */
     const seen = new Set(components.map((c) => c.name));
     const transitiveComponents: typeof components = [];
     const topModulesDir = path.join(root, "node_modules");
+    const hasNodeModules = existsSync(topModulesDir);
     try {
-      const walkScopes = async (base: string) => {
-        const entries = await readdir(base, { withFileTypes: true }).catch(() => []);
-        for (const e of entries) {
-          if (!e.isDirectory()) continue;
-          if (e.name.startsWith(".")) continue;
-          if (e.name.startsWith("@")) {
-            const scopeEntries = await readdir(path.join(base, e.name), { withFileTypes: true }).catch(() => []);
-            for (const se of scopeEntries) {
-              if (!se.isDirectory()) continue;
-              const scoped = `${e.name}/${se.name}`;
-              if (seen.has(scoped)) continue;
-              seen.add(scoped);
-              const pkgPath = path.join(base, e.name, se.name, "package.json");
+      if (hasNodeModules) {
+        const walkScopes = async (base: string) => {
+          const entries = await readdir(base, { withFileTypes: true }).catch(() => []);
+          for (const e of entries) {
+            if (!e.isDirectory()) continue;
+            if (e.name.startsWith(".")) continue;
+            if (e.name.startsWith("@")) {
+              const scopeEntries = await readdir(path.join(base, e.name), { withFileTypes: true }).catch(() => []);
+              for (const se of scopeEntries) {
+                if (!se.isDirectory()) continue;
+                const scoped = `${e.name}/${se.name}`;
+                if (seen.has(scoped)) continue;
+                seen.add(scoped);
+                const pkgPath = path.join(base, e.name, se.name, "package.json");
+                try {
+                  const m = JSON.parse(await readFile(pkgPath, "utf-8")) as { name?: string; version?: string; license?: string | { type?: string } };
+                  let lic = "UNKNOWN";
+                  if (typeof m.license === "string") lic = m.license;
+                  else if (m.license?.type) lic = m.license.type;
+                  transitiveComponents.push({ name: m.name ?? scoped, version: m.version ?? "0.0.0", license: lic, type: "transitive" });
+                } catch { /* not a package */ }
+              }
+            } else {
+              if (seen.has(e.name)) continue;
+              seen.add(e.name);
+              const pkgPath = path.join(base, e.name, "package.json");
               try {
                 const m = JSON.parse(await readFile(pkgPath, "utf-8")) as { name?: string; version?: string; license?: string | { type?: string } };
                 let lic = "UNKNOWN";
                 if (typeof m.license === "string") lic = m.license;
                 else if (m.license?.type) lic = m.license.type;
-                transitiveComponents.push({ name: m.name ?? scoped, version: m.version ?? "0.0.0", license: lic, type: "transitive" });
+                transitiveComponents.push({ name: m.name ?? e.name, version: m.version ?? "0.0.0", license: lic, type: "transitive" });
               } catch { /* not a package */ }
             }
-          } else {
-            if (seen.has(e.name)) continue;
-            seen.add(e.name);
-            const pkgPath = path.join(base, e.name, "package.json");
-            try {
-              const m = JSON.parse(await readFile(pkgPath, "utf-8")) as { name?: string; version?: string; license?: string | { type?: string } };
-              let lic = "UNKNOWN";
-              if (typeof m.license === "string") lic = m.license;
-              else if (m.license?.type) lic = m.license.type;
-              transitiveComponents.push({ name: m.name ?? e.name, version: m.version ?? "0.0.0", license: lic, type: "transitive" });
-            } catch { /* not a package */ }
           }
+        };
+        await walkScopes(topModulesDir);
+      } else {
+        /* Fallback: parse package-lock.json for the full resolved tree.
+           npm lockfile v3 has a `packages` object keyed by path like
+           "node_modules/foo" or "node_modules/@scope/bar". The root
+           package is keyed by "" (empty string). Each entry has `version`
+           and optionally `license` / `licenses`. */
+        const lockPath = path.join(root, "package-lock.json");
+        if (existsSync(lockPath)) {
+          warnings.push("node_modules absent — using package-lock.json for resolved versions");
+          const lock = JSON.parse(await readFile(lockPath, "utf-8")) as {
+            packages?: Record<string, { version?: string; license?: string | { type?: string }; licenses?: Array<{ type?: string }>; dev?: boolean; optional?: boolean; link?: boolean }>;
+          };
+          const packages = lock.packages ?? {};
+          for (const [pkgPath, meta] of Object.entries(packages)) {
+            if (!pkgPath || meta.link) continue; /* skip root + symlinks */
+            const name = pkgPath.replace(/^node_modules\//, "");
+            if (seen.has(name)) continue;
+            seen.add(name);
+            let lic = "UNKNOWN";
+            if (typeof meta.license === "string") lic = meta.license;
+            else if (meta.license?.type) lic = meta.license.type;
+            else if (meta.licenses?.[0]?.type) lic = meta.licenses[0].type;
+            transitiveComponents.push({
+              name,
+              version: meta.version ?? "0.0.0",
+              license: lic,
+              type: meta.dev ? "development" : "transitive",
+            });
+          }
+        } else {
+          warnings.push("no node_modules and no package-lock.json — transitive dependencies unknown");
         }
-      };
-      await walkScopes(topModulesDir);
+      }
     } catch {
       warnings.push("could not walk node_modules for transitive dependencies");
     }

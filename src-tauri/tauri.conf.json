@@ -5,7 +5,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:3000",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build && npm run build:worker",
     "frontendDist": "http://127.0.0.1:3000"
   },
   "app": {
@@ -35,7 +35,7 @@
       "../.next/standalone": "server/",
       "../.next/static": "server/.next/static/",
       "../public": "server/public/",
-      "../src/worker": "server/src/worker/",
+      "../dist/worker": "server/worker/",
       "../src/services": "server/src/services/",
       "../src/db": "server/src/db/",
       "../src/lib": "server/src/lib/",

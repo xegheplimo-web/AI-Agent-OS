@@ -30,9 +30,9 @@ Audit · Architecture · Recovery · Functional Parity — xây từ **design sy
 | Agent orchestration, planner, model router, MCP, sandbox | **Chưa có** |
 | OTLP ingestion thật | **Chưa có** — `source: "otlp"` chưa bao giờ trả |
 | Docker image build trong CI | **Có** — CI build + smoke test Docker image |
-| Tauri desktop distributable | **Build matrix có** (NSIS/DMG/DEB), CSP đã set, worker path đã sửa — nhưng yêu cầu system Node 22+ (chưa bundle Node runtime), chưa signing/updater |
+| Tauri desktop distributable | **Build matrix có** (NSIS/DMG/DEB), CSP đã set, worker được compile TS→JS bằng esbuild trước khi bundle — nhưng yêu cầu system Node 22+ (chưa bundle Node runtime), chưa signing/updater |
 | Production rules enforcement | **Chưa có** — rules là setting/UI only, backend chưa enforce |
-| Login rate limit / account lockout | **Chưa có** |
+| Login rate limit / account lockout | **Có** — 5 failed attempts → 15 min lockout (in-memory per username+IP, single-instance only) |
 | Cookie `Secure` flag production | **Có** — `Secure` khi `NODE_ENV=production && !isDemoMode` |
 
 ## Kiến trúc
@@ -79,7 +79,7 @@ Sáu scanner chạy **read-only** trên target system — không spawn process, 
 | Scanner | Làm gì thật | Bằng chứng sinh ra |
 |---|---|---|
 | `filesystem-inventory` | walk repo, đếm file/LOC theo extension, kiểm tra lockfile & config bắt buộc | `host_inventory.json`, `repo_inventory.json` |
-| `package-inventory` | đọc `package.json` + resolve version/license thật từ `node_modules` | `package_inventory.json` → CycloneDX SBOM |
+| `package-inventory` | đọc `package.json` + resolve version/license thật từ `node_modules` (fallback `package-lock.json` khi không có `node_modules`) | `package_inventory.json` → CycloneDX SBOM |
 | `secret-scan` | 6 rule kiểu gitleaks (AWS key, private key block, bearer, postgres URL có password…) + allowlist | `security_scan.json` |
 | `database-inventory` | `information_schema` + `pg_indexes` **SELECT only**, phát hiện hot column thiếu index | `database_inventory.json` |
 | `runtime-inventory` | node/platform/uptime + đối chiếu `.env.example` ↔ `process.env`, bắt giá trị placeholder | `env_matrix.json` |
@@ -106,7 +106,8 @@ Service layer tại `src/services/` (`mode.ts` + `audit.ts` + `jobs.ts` + `telem
 ```bash
 cp .env.example .env        # điền DATABASE_URL, API_INTERNAL_TOKEN, SESSION_SECRET
 npm ci
-npm run db:push             # npx drizzle-kit push --force
+npm run db:push             # npx drizzle-kit push --force (dev only)
+npm run db:migrate          # npx drizzle-kit migrate (production — có ledger)
 npm run db:seed             # npx tsx src/db/seed.ts   (demo only)
 npm run dev
 ```
@@ -179,7 +180,7 @@ make docker-up            # full stack qua compose
 - **Vitest**: `tests/unit/` — audit stage machine, parity scoring/diff (fail-closed, db_schema fail-closed), lease fence (LeaseLostError, heartbeat eviction), knowledge index (Unicode tokenizer, scoped deletion), self-approval forbid, contracts, auth (scrypt, role permissions, requirePermission 401/403), utils. **96 tests, all green trên Node 22 / npm 10.9.8.**
 - **GitHub Actions** (`.github/workflows/ci.yml`): install → dependency audit → lint → typecheck → push schema → **verify migrations apply trên DB sạch** (apply từng file `.sql` qua `psql -v ON_ERROR_STOP=1`, kiểm tra bảng `audits` + index `audits_active_uidx`) → **migration upgrade test** (apply migrations cũ → insert row → apply migration mới trên top) → seed → tests → verify:worker → verify:executors → verify:release → build → API smoke test → Docker build + smoke → docker compose config validation (cả demo + production profile) → Tauri build matrix (Linux/Windows/macOS).
 - **Toolchain**: Node 22 + npm 10.9.8 là canonical (CI và Docker cùng dùng Node 22). `package.json` khai báo `engines`, `.nvmrc` pin Node 22. Lockfile phải được tạo/cập nhật bằng npm 10 — npm 11 (Node 24) sinh layout `tsx → esbuild` khác và `npm ci` trên CI (npm 10) sẽ từ chối.
-- **CI status**: CI đã chạy xanh trên GitHub (PR #4, run #30576409860 trên commit `b9bd0f5`). Tất cả 4 job pass: verify (2m38s) + tauri-build Windows nsis (7m15s) + macOS dmg (4m50s) + Linux deb (4m45s). Installer artifacts được upload thật. `npm audit` reports 16 vulnerabilities (4 moderate, 12 high) từ nhiều nguồn (`sharp`/`libvips`, `brace-expansion`/`minimatch`, `esbuild`, `postcss`, ESLint chain) — tất cả đều là transitive dependencies của `next`/`eslint-config-next`, không fix được mà không breaking. CI giữ `continue-on-error` cho bước này.
+- **CI status**: CI đã chạy xanh trên GitHub (PR #4, run #30578790254 trên commit `61461fa`). Tất cả 4 job pass: 96/96 unit tests, 23/23 worker checks, 13/13 executor checks, 11/11 release checks + tauri-build matrix (NSIS/DMG/DEB). Installer artifacts được upload thật. `npm audit` reports 16 vulnerabilities (4 moderate, 12 high) từ nhiều nguồn (`sharp`/`libvips`, `brace-expansion`/`minimatch`, `esbuild`, `postcss`, ESLint chain) — tất cả đều là transitive dependencies của `next`/`eslint-config-next`, không fix được mà không breaking. CI giữ `continue-on-error` cho bước này.
 
 ## Worker (production queue)
 
@@ -190,7 +191,7 @@ APP_MODE=production npm run worker
 
 **Ownership rule**: mỗi `audit.run` job mang `auditId`; worker chỉ chạy audit của job **chính nó đã claim** (`locked_by = workerId`, `lease_token = token`). Quét `audits WHERE status='running'` sẽ khiến hai worker cùng chạy một audit — đó là lỗi đã được sửa và có regression test. `advanceJobsOnce(workerId)` cũng lọc theo `locked_by` cho non-audit jobs, nên hai worker không cùng advance một job.
 
-- **Lease fencing**: `heartbeat()` và `setJobProgress()` dùng `RETURNING` — nếu stale supervisor requeue job (clear lease_token) và worker khác claim, update từ worker cũ match 0 rows → throw `LeaseLostError` → worker cũ dừng ngay, không ghi thêm. Mỗi nhóm side effect (scanner raw artifacts, normalization + findings, reconstruction, finalize) chạy trong `fencedTx()` — SELECT FOR UPDATE trên job row + writes trong cùng transaction, không TOCTOU window giữa lease check và write. **Non-audit executors** dùng `fencedWrite()` cho artifact upsert, parity report, settings insert, knowledge index — lease check là statement đầu tiên trong transaction. Parity-failed branch kiểm zero-row update và throw `LeaseLostError` (không commit khi lease đã mất). Background heartbeat timer 15s giữ job alive khi scanner/executor chạy lâu.
+- **Lease fencing**: `heartbeat()` và `setJobProgress()` dùng `RETURNING` — nếu stale supervisor requeue job (clear lease_token) và worker khác claim, update từ worker cũ match 0 rows → throw `LeaseLostError` → worker cũ dừng ngay, không ghi thêm. Mỗi nhóm side effect (scanner raw artifacts, normalization + findings, reconstruction, finalize, **error path**) chạy trong `fencedTx()` — SELECT FOR UPDATE trên job row + writes trong cùng transaction, không TOCTOU window giữa lease check và write. **Non-audit executors** dùng `fencedWrite()` cho artifact upsert, parity report, settings insert, knowledge index — lease check là statement đầu tiên trong transaction. Parity-failed branch kiểm zero-row update và throw `LeaseLostError` (không commit khi lease đã mất). **Lock order** thống nhất jobs→audits cho cả finalize, error path, và cancel (SELECT FOR UPDATE jobs row trước, rồi update audits) — không deadlock. Background heartbeat timer 15s giữ job alive khi scanner/executor chạy lâu.
 - **LEASE_LOST exit**: khi lease bị mất, worker cũ không sửa audit/job state, không requeue/fail (để worker mới xử lý), chỉ phát event `job.requeued` cảnh báo (observability, không phải state mutation)
 - Claim: `FOR UPDATE SKIP LOCKED`, `attempt < max_attempts`, **`LIMIT 1`** (worker xử lý tuần tự; claim 3 sẽ để 2 job kẹt `running` không heartbeat cho đến khi stale supervisor requeue)
 - **Retry đúng maxAttempts**: non-audit executor error → requeue (`status: "queued"`) khi `attempt < maxAttempts`, fail khi hết. Trước đây luôn `status: "failed"` bỏ qua retry budget
@@ -308,8 +309,9 @@ src-tauri/                # desktop scaffold
 - [ ] Playwright E2E suite
 - [ ] OIDC provider thay cho auth nội bộ tối thiểu
 - [ ] Markdown/Mermaid/SARIF renderers cho artifact viewer
-- [ ] Tauri installer signing + updater + Node runtime bundling thật (hiện scaffold + build matrix, yêu cầu system Node 22+)
+- [ ] Tauri installer signing + updater + Node runtime bundling thật (hiện scaffold + build matrix, worker compile TS→JS bằng esbuild, yêu cầu system Node 22+)
 - [ ] Production rules enforcement (backend, không chỉ UI)
 - [ ] Tauri desktop distributable: build theo OS matrix, CSP, signing, updater
-- [ ] Tauri: bundle Node runtime vào installer (hiện yêu cầu system Node 22+; worker path mismatch đã sửa)
-- [ ] DB migrations thay vì db:push cho production deploy — migrations đã có và CI đã verify apply (clean + upgrade test), nhưng `docker-compose.yml` vẫn dùng `drizzle-kit push` cho schema bootstrap. Chuyển hẳn sang `psql -f` apply migrations cho production deploy khi drizzle-kit `migrate` ổn định trên PostgreSQL 17.
+- [x] ~~Tauri: worker path mismatch~~ — worker compile TS→JS bằng esbuild (`npm run build:worker`), bundle vào `server/worker/index.js`, main.rs gọi đúng path
+- [x] ~~DB migrations thay vì db:push cho production deploy~~ — `docker-compose.yml` đã chuyển sang `drizzle-kit migrate` (có ledger, ordered, auditable)
+- [ ] Tauri: bundle Node runtime vào installer (hiện yêu cầu system Node 22+, có runtime check + MessageBox trên Windows)

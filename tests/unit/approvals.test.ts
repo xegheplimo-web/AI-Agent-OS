@@ -28,6 +28,10 @@ function makeTx() {
     from: () => ({
       where: () => ({
         limit: () => Promise.resolve([{ id: "aud-done", status: "completed" }]),
+        /* .for("update") is used by cancelAudit's lock-order fix (P1-2):
+           SELECT FOR UPDATE on jobs rows before updating audits. Returns
+           empty array — no running jobs for a completed/waiting audit. */
+        for: () => Promise.resolve([]),
       }),
     }),
   });

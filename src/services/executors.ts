@@ -221,7 +221,7 @@ export async function executeParityGate(job: JobRow, lease?: LeaseFence): Promis
 
   const gates = [
     { key: "secrets_scan", label: "Secrets scan", status: inv.findings.some((f) => f.category === "security" && f.severity === "critical") ? "failed" : "passed" },
-    { key: "sbom_diff", label: "SBOM generated", status: "passed" },
+    { key: "sbom_generated", label: "SBOM generated", status: "passed" },
     { key: "endpoint_authz", label: "Endpoint authorization", status: checks.find((c) => c.key === "endpoint_authz")?.status ?? "pending" },
     { key: "lockfile", label: "Deterministic install (lockfile)", status: (inv.repo as { lockFilePresent?: boolean }).lockFilePresent ? "passed" : "failed" },
   ];

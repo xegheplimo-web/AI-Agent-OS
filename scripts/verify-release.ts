@@ -58,6 +58,13 @@ async function main() {
   const pkg = await readJson(path.join(ROOT, "package.json"));
   const cargo = await readFile(path.join(ROOT, "src-tauri/Cargo.toml"), "utf-8");
   const cargoVersion = cargo.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+
+  /* ---------- 4b. Cargo.lock exists (reproducible Rust builds) ---------- */
+  /* For binary applications, Cargo.lock MUST be committed so that dependency
+     versions are pinned between builds. Without it, `cargo build` may pick
+     different crate versions on each run, producing non-reproducible binaries. */
+  const cargoLockPath = path.join(ROOT, "src-tauri/Cargo.lock");
+  check("src-tauri/Cargo.lock exists (reproducible Rust builds)", existsSync(cargoLockPath));
   const versionModule = await readFile(path.join(ROOT, "src/lib/version.ts"), "utf-8");
   const moduleVersion = versionModule.match(/APP_VERSION\s*=\s*"([^"]+)"/)?.[1];
   /* GENERATOR_VERSION may be a string literal or an alias `= APP_VERSION`.

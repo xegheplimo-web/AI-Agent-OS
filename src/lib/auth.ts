@@ -271,16 +271,27 @@ export function clientIp(req: Request): string | null {
      configured. Without this, a client can spoof its IP via the header
      and bypass rate limiting. TRUSTED_PROXY_CIDR is a comma-separated
      list of CIDR ranges (e.g. "10.0.0.0/8,172.16.0.0/12"). When unset,
-     we fall back to the socket peer IP (x-real-ip set by the reverse
-     proxy) or "unknown" — never the client-supplied x-forwarded-for. */
+     we DO NOT trust any client-supplied header — a direct client can
+     set x-real-ip / x-forwarded-for to any value to evade rate limits.
+
+     NOTE: This in-memory rate limiter is per-instance and resets on
+     restart. For multi-instance deployments, use a shared store (Redis)
+     — see the `cache` profile in docker-compose.yml. The current limiter
+     is suitable for single-instance / desktop mode only. */
   const trustedProxy = process.env.TRUSTED_PROXY_CIDR;
+  if (!trustedProxy) {
+    /* No trusted proxy: do NOT trust x-real-ip or x-forwarded-for.
+       A direct client can forge these headers. Return null so the rate
+       limiter falls back to a single "unknown" bucket — all direct
+       clients share it, which is safe (no bypass possible). */
+    return null;
+  }
   const xff = req.headers.get("x-forwarded-for");
-  const xRealIp = req.headers.get("x-real-ip");
-  if (trustedProxy && xff) {
+  if (xff) {
     /* Trusted proxy: take the leftmost (original client) IP. */
     return xff.split(",")[0]?.trim() ?? null;
   }
-  /* No trusted proxy configured: x-real-ip is set by our own reverse
-     proxy (nginx/Caddy) from the actual socket, not client-supplied. */
-  return xRealIp ?? null;
+  /* Trusted proxy configured but no x-forwarded-for header — try
+     x-real-ip (set by nginx/Caddy from the actual socket). */
+  return req.headers.get("x-real-ip") ?? null;
 }

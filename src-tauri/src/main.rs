@@ -94,18 +94,82 @@ fn audit_target_root(app: &tauri::AppHandle) -> String {
         .unwrap_or_else(|_| ".".into())
 }
 
-/// Check that the system `node` binary is available. The Tauri installer does
-/// NOT bundle Node — it requires Node 22+ to be installed on the host system.
-/// Without this check, a missing Node produces a cryptic spawn error; with it,
-/// the user gets a clear message explaining the prerequisite.
+/// Check that the system `node` binary is available AND is Node 22+.
+/// The Tauri installer does NOT bundle Node — it requires Node 22+ to be
+/// installed on the host system (per package.json `engines.node`).
+///
+/// Without this check, a missing or too-old Node produces a cryptic spawn
+/// error. With it, the user gets a clear message. On Windows the console is
+/// hidden (windows_subsystem = "windows"), so stderr is unreachable — we
+/// show a native MessageBox dialog instead.
 fn check_node_runtime() -> bool {
-    match Command::new("node").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).output() {
-        Ok(out) if out.status.success() => true,
+    let output = Command::new("node")
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    let version_str = match output {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
         _ => {
-            eprintln!("[shell] ERROR: Node.js not found on PATH.");
-            eprintln!("[shell]        This app requires Node 22+ to be installed on the system.");
-            eprintln!("[shell]        Download from https://nodejs.org/ and restart the app.");
-            false
+            let msg = "Node.js was not found on PATH.\n\nThis app requires Node.js 22+ to be installed on the system.\nDownload it from https://nodejs.org/ and restart the app.";
+            show_node_error(msg);
+            return false;
+        }
+    };
+
+    /* Parse "v22.x.x" → major = 22. Reject anything below 22. */
+    let major: u32 = version_str
+        .strip_prefix('v')
+        .unwrap_or(&version_str)
+        .split('.')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    if major < 22 {
+        let msg = format!(
+            "Node.js {} is too old.\n\nThis app requires Node.js 22+ (found {}).\
+            \nDownload the latest LTS from https://nodejs.org/ and restart the app.",
+            version_str, version_str
+        );
+        show_node_error(&msg);
+        return false;
+    }
+
+    true
+}
+
+/// Show a Node prerequisite error to the user. On Windows the app has no
+/// console (windows_subsystem = "windows"), so eprintln goes nowhere — we use
+/// a native Win32 MessageBox via the `windows_subsystem` attribute. On other
+/// platforms, stderr is visible so we print there.
+fn show_node_error(msg: &str) {
+    eprintln!("[shell] ERROR: {}", msg.replace('\n', " "));
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::CString;
+        if let Ok(c_msg) = CString::new(msg) {
+            if let Ok(c_title) = CString::new("AI Agent OS — Node.js Required") {
+                extern "C" {
+                    fn MessageBoxA(
+                        hwnd: *mut std::ffi::c_void,
+                        lp_text: *const i8,
+                        lp_caption: *const i8,
+                        u_type: u32,
+                    ) -> i32;
+                }
+                unsafe {
+                    MessageBoxA(
+                        std::ptr::null_mut(),
+                        c_msg.as_ptr(),
+                        c_title.as_ptr(),
+                        0x10, /* MB_ICONERROR */
+                    );
+                }
+            }
         }
     }
 }
@@ -136,7 +200,7 @@ fn spawn_worker(app: &tauri::AppHandle) -> Option<Child> {
         return None;
     }
     if !check_node_runtime() { return None; }
-    let worker = resource(app, "server/src/worker/index.js")?;
+    let worker = resource(app, "server/worker/index.js")?;
     println!("[shell] starting worker sidecar → {worker:?}");
     Command::new("node")
         .arg(&worker)

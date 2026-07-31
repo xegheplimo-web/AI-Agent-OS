@@ -458,6 +458,18 @@ export async function cancelAudit(
 ): Promise<{ ok: boolean; error?: string }> {
   try {
     const result = await db.transaction(async (tx) => {
+      /* P1-2: Lock order MUST be jobs → audits (same as the finalize/error
+         paths in engine.ts, which SELECT FOR UPDATE the jobs row first).
+         Previously cancel updated audits first then jobs — a concurrent
+         finalize (jobs→audits) could deadlock with cancel (audits→jobs).
+         Now we lock the jobs row(s) first via SELECT ... FOR UPDATE, then
+         update audits, then update jobs, then approvals, then event. */
+      const jobRows = await tx
+        .select({ id: jobs.id, status: jobs.status, auditId: jobs.auditId })
+        .from(jobs)
+        .where(and(eq(jobs.auditId, auditId), inArray(jobs.status, ["queued", "running"])))
+        .for("update");
+
       /* Only running or waiting_approval audits can be cancelled. A completed
          or already-cancelled audit is immutable. The WHERE clause makes the
          check + update atomic. */
@@ -487,19 +499,21 @@ export async function cancelAudit(
          in-flight fencedJobUpdate or assert() by the old worker will see
          0 matching rows → LeaseLostError → abort. Without this, the worker
          keeps its lease token and can still write artifacts/findings even
-         though the job is 'cancelled'. */
-      await tx
-        .update(jobs)
-        .set({
-          status: "cancelled",
-          finishedAt: new Date(),
-          errorCode: "AUDIT_CANCELLED",
-          errorMessage: "audit cancelled by operator",
-          leaseToken: null,
-          lockedBy: null,
-          worker: null,
-        })
-        .where(and(eq(jobs.auditId, auditId), inArray(jobs.status, ["queued", "running"])));
+         though the job is 'cancelled'. The jobs row(s) were locked above. */
+      if (jobRows.length) {
+        await tx
+          .update(jobs)
+          .set({
+            status: "cancelled",
+            finishedAt: new Date(),
+            errorCode: "AUDIT_CANCELLED",
+            errorMessage: "audit cancelled by operator",
+            leaseToken: null,
+            lockedBy: null,
+            worker: null,
+          })
+          .where(inArray(jobs.id, jobRows.map((j) => j.id)));
+      }
 
       await tx.insert(events).values({
         type: "audit.cancelled",

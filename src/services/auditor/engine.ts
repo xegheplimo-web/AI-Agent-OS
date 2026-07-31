@@ -442,7 +442,7 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
        same effective status. */
     const parityGates = [
       { key: "secrets_scan", label: "Secrets scan", status: counts.critical > 0 ? "failed" : "passed" },
-      { key: "sbom_diff", label: "SBOM generated", status: "passed" },
+      { key: "sbom_generated", label: "SBOM generated", status: "passed" },
       { key: "endpoint_authz", label: "Endpoint authorization", status: checks.find((c) => c.key === "endpoint_authz")?.status ?? "passed" },
       { key: "lockfile", label: "Deterministic install (lockfile)", status: (inv.repo as { lockFilePresent?: boolean }).lockFilePresent ? "passed" : "failed" },
     ];
@@ -689,74 +689,108 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
     const idx = stages.findIndex((s) => s.status === "active");
     if (idx >= 0) stages[idx].status = "failed";
 
-    /* Lease-fence the audit failure update: if the stale supervisor already
-       requeued the job and a new worker claimed it, our error-path write
-       must NOT clobber the new owner's audit state. We check the job's
-       lease_token first — if it doesn't match, the audit is no longer ours. */
-    if (leaseToken && jobId) {
-      /* Error path lease check must also verify status = 'running' —
-         cancelAudit sets status = 'cancelled' and clears lease_token.
-         A stale worker whose job was cancelled must not write failure
-         state on top of the cancellation. */
-      const [currentJob] = await db.select({ leaseToken: jobs.leaseToken, status: jobs.status }).from(jobs).where(eq(jobs.id, jobId)).limit(1);
-      if (!currentJob || currentJob.leaseToken !== leaseToken || currentJob.status !== "running") {
-        /* Lease lost during error path — another worker owns the audit now,
-           or the job was cancelled. Do not write audit/job/event state. */
-        return;
-      }
-    }
-    await db
-      .update(audits)
-      .set({ status: "failed", finishedAt: new Date(), stages })
-      .where(eq(audits.id, auditId));
+    /* P0-1: Fence the ENTIRE error path — not just a pre-check. Previously
+       the error path did a lease check, then wrote audit→failed, job update,
+       and event in SEPARATE statements. The lease could be lost between the
+       check and any of those writes, letting a stale worker clobber the new
+       owner's audit state or emit a spurious audit.failed event.
 
-    if (jobId) {
-      /* Let the queue decide: retry while attempts remain, otherwise fail.
-         Lease fencing: only update if we still own the job. If the stale
-         supervisor already requeued it, our update is a no-op. */
-      const jobRows = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
-      const job = jobRows[0];
-      const exhausted = !job || job.attempt >= job.maxAttempts;
-      const leaseFilter = leaseToken
-        ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken), eq(jobs.status, "running"))
-        : eq(jobs.id, jobId);
-      await db
-        .update(jobs)
-        .set({
-          status: exhausted ? "failed" : "queued",
-          lockedBy: null,
-          leaseToken: null,
-          worker: exhausted ? job?.worker : null,
-          progress: exhausted ? job?.progress ?? 0 : 0,
-          errorCode: "AUDIT_ENGINE_ERROR",
-          errorMessage: message.slice(0, 500),
-          finishedAt: exhausted ? new Date() : null,
-          updatedAt: new Date(),
-        })
-        .where(leaseFilter);
+       Now the entire error path runs inside fencedTx: SELECT FOR UPDATE on
+       the job row (verifying lease_token + status = 'running') is the first
+       statement, and all writes (audit→failed, job→failed/queued, event,
+       audit→running for retry) are in the same transaction. If the lease is
+       lost, the transaction aborts before ANY write — no partial state.
 
-      /* A retryable job puts the audit back in the runnable state — but only
-         if a concurrent requeueStaleJobs hasn't already timed out the job.
-         Without this guard, the engine can resurrect a `failed` audit whose
-         job was already set to `timed_out` by the supervisor, leaving the
-         audit orphaned (running with no active job). */
-      if (!exhausted) {
-        const [currentJob] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
-        if (currentJob?.status !== "timed_out") {
-          await db
-            .update(audits)
-            .set({ status: "running", finishedAt: null })
-            .where(and(eq(audits.id, auditId), eq(audits.status, "failed")));
+       Lock order: jobs row locked first (FOR UPDATE), then audits updated —
+       same order as the finalize path, so cancel and finalize/error cannot
+       deadlock (P1-2). */
+    try {
+      await fencedTx(jobId, leaseToken, hb, async (tx) => {
+        /* Read the job row to determine retry vs fail — it's already locked
+           by the FOR UPDATE in fencedTx, so this read is consistent. */
+        let exhausted = true;
+        let jobWorker: string | null = null;
+        let jobProgress = 0;
+        if (jobId) {
+          const jobRows = await tx.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
+          const job = jobRows[0];
+          exhausted = !job || job.attempt >= job.maxAttempts;
+          jobWorker = job?.worker ?? null;
+          jobProgress = job?.progress ?? 0;
         }
-      }
+
+        /* audit → failed (or → running for retry). Same transaction as the
+           job update so a crash between them cannot orphan either side. */
+        if (exhausted) {
+          await tx
+            .update(audits)
+            .set({ status: "failed", finishedAt: new Date(), stages })
+            .where(eq(audits.id, auditId));
+        } else {
+          /* Retryable: put audit back to running so the re-claimed job can
+             resume. Guard against requeueStaleJobs having already timed out
+             the job — if so, don't resurrect a failed audit. */
+          await tx
+            .update(audits)
+            .set({ status: "failed", finishedAt: new Date(), stages })
+            .where(eq(audits.id, auditId));
+        }
+
+        if (jobId) {
+          /* Job update with lease filter — 0 rows means lease lost, throw to
+             abort the transaction. The WHERE clause includes lease_token +
+             status = 'running' so cancelAudit (which sets status='cancelled'
+             and clears lease_token) prevents this update from matching. */
+          const leaseFilter = leaseToken
+            ? and(eq(jobs.id, jobId), eq(jobs.leaseToken, leaseToken), eq(jobs.status, "running"))
+            : eq(jobs.id, jobId);
+          const updated = await tx
+            .update(jobs)
+            .set({
+              status: exhausted ? "failed" : "queued",
+              lockedBy: null,
+              leaseToken: null,
+              worker: exhausted ? jobWorker : null,
+              progress: exhausted ? jobProgress : 0,
+              errorCode: "AUDIT_ENGINE_ERROR",
+              errorMessage: message.slice(0, 500),
+              finishedAt: exhausted ? new Date() : null,
+              updatedAt: new Date(),
+            })
+            .where(leaseFilter)
+            .returning({ id: jobs.id });
+          if (leaseToken && !updated.length) {
+            throw new LeaseLostError();
+          }
+
+          /* Retryable: put audit back to running — but only if the job
+             wasn't already timed_out by a concurrent requeueStaleJobs. */
+          if (!exhausted) {
+            const [currentJob] = await tx.select({ status: jobs.status }).from(jobs).where(eq(jobs.id, jobId)).limit(1);
+            if (currentJob?.status !== "timed_out") {
+              await tx
+                .update(audits)
+                .set({ status: "running", finishedAt: null })
+                .where(and(eq(audits.id, auditId), eq(audits.status, "failed")));
+            }
+          }
+        }
+
+        await tx.insert(events).values({
+          type: "audit.failed",
+          severity: "error",
+          source: "auditor",
+          message: `${audit.name} failed: ${message}`,
+        });
+      });
+    } catch (fenceErr) {
+      /* If the fencedTx threw LeaseLostError, the lease was lost during the
+         error path — another worker owns the audit now, or it was cancelled.
+         Do not write anything; exit silently. */
+      if (fenceErr instanceof LeaseLostError) return;
+      throw fenceErr;
     }
 
-    await db.insert(events).values({
-      type: "audit.failed",
-      severity: "error",
-      source: "auditor",
-      message: `${audit.name} failed: ${message}`,
-    });
     await logAudit({
       actor: null,
       action: "audit.failed",
