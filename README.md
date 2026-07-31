@@ -30,7 +30,7 @@ Audit · Architecture · Recovery · Functional Parity — xây từ **design sy
 | Agent orchestration, planner, model router, MCP, sandbox | **Chưa có** |
 | OTLP ingestion thật | **Chưa có** — `source: "otlp"` chưa bao giờ trả |
 | Docker image build trong CI | **Có** — CI build + smoke test Docker image |
-| Tauri desktop distributable | **Build matrix có** (NSIS/DMG/DEB), CSP đã set, worker được compile TS→JS bằng esbuild trước khi bundle — nhưng yêu cầu system Node 22+ (chưa bundle Node runtime), chưa signing/updater |
+| Tauri desktop distributable | **Build matrix có** (NSIS/DMG/DEB), CSP đã set, worker được compile TS→JS bằng esbuild trước khi bundle — nhưng yêu cầu system Node 22.x (chưa bundle Node runtime), chưa signing/updater |
 | Production rules enforcement | **Chưa có** — rules là setting/UI only, backend chưa enforce |
 | Login rate limit / account lockout | **Có** — 5 failed attempts → 15 min lockout (in-memory per username+IP, single-instance only) |
 | Cookie `Secure` flag production | **Có** — `Secure` khi `NODE_ENV=production && !isDemoMode` |
@@ -107,7 +107,8 @@ Service layer tại `src/services/` (`mode.ts` + `audit.ts` + `jobs.ts` + `telem
 cp .env.example .env        # điền DATABASE_URL, API_INTERNAL_TOKEN, SESSION_SECRET
 npm ci
 npm run db:push             # npx drizzle-kit push --force (dev only)
-npm run db:migrate          # npx drizzle-kit migrate (production — có ledger)
+npm run db:migrate          # npx drizzle-kit migrate (có bug trên PG17, không dùng cho production)
+npm run db:migrate:run      # tsx scripts/migrate.ts (production — custom runner, có ledger, hoạt động trên PG17)
 npm run db:seed             # npx tsx src/db/seed.ts   (demo only)
 npm run dev
 ```
@@ -180,7 +181,7 @@ make docker-up            # full stack qua compose
 - **Vitest**: `tests/unit/` — audit stage machine, parity scoring/diff (fail-closed, db_schema fail-closed), lease fence (LeaseLostError, heartbeat eviction), knowledge index (Unicode tokenizer, scoped deletion), self-approval forbid, contracts, auth (scrypt, role permissions, requirePermission 401/403), utils. **96 tests, all green trên Node 22 / npm 10.9.8.**
 - **GitHub Actions** (`.github/workflows/ci.yml`): install → dependency audit → lint → typecheck → push schema → **verify migrations apply trên DB sạch** (apply từng file `.sql` qua `psql -v ON_ERROR_STOP=1`, kiểm tra bảng `audits` + index `audits_active_uidx`) → **migration upgrade test** (apply migrations cũ → insert row → apply migration mới trên top) → seed → tests → verify:worker → verify:executors → verify:release → build → API smoke test → Docker build + smoke → docker compose config validation (cả demo + production profile) → Tauri build matrix (Linux/Windows/macOS).
 - **Toolchain**: Node 22 + npm 10.9.8 là canonical (CI và Docker cùng dùng Node 22). `package.json` khai báo `engines`, `.nvmrc` pin Node 22. Lockfile phải được tạo/cập nhật bằng npm 10 — npm 11 (Node 24) sinh layout `tsx → esbuild` khác và `npm ci` trên CI (npm 10) sẽ từ chối.
-- **CI status**: CI đã chạy xanh trên GitHub (PR #4, run #30578790254 trên commit `61461fa`). Tất cả 4 job pass: 96/96 unit tests, 23/23 worker checks, 13/13 executor checks, 11/11 release checks + tauri-build matrix (NSIS/DMG/DEB). Installer artifacts được upload thật. `npm audit` reports 16 vulnerabilities (4 moderate, 12 high) từ nhiều nguồn (`sharp`/`libvips`, `brace-expansion`/`minimatch`, `esbuild`, `postcss`, ESLint chain) — tất cả đều là transitive dependencies của `next`/`eslint-config-next`, không fix được mà không breaking. CI giữ `continue-on-error` cho bước này.
+- **CI status**: CI chạy trên mỗi push. Lần xanh gần nhất: run #30578790254 trên commit `61461fa` (96/96 tests, 23/23 worker checks, 13/13 executor checks, 11/11 release checks + tauri-build matrix). Commit `9ade136` đã đỏ do lockfile out of sync — fix trong commit này (lockfile regenerated + verify-release deep sync check). Xem trạng thái CI mới nhất trên [PR #4](https://github.com/xegheplimo-web/AI-Agent-OS/pull/4). `npm audit` reports 16 vulnerabilities (4 moderate, 12 high) từ nhiều nguồn (`sharp`/`libvips`, `brace-expansion`/`minimatch`, `esbuild`, `postcss`, ESLint chain) — tất cả đều là transitive dependencies của `next`/`eslint-config-next`, không fix được mà không breaking. CI giữ `continue-on-error` cho bước này.
 
 ## Worker (production queue)
 
@@ -309,9 +310,9 @@ src-tauri/                # desktop scaffold
 - [ ] Playwright E2E suite
 - [ ] OIDC provider thay cho auth nội bộ tối thiểu
 - [ ] Markdown/Mermaid/SARIF renderers cho artifact viewer
-- [ ] Tauri installer signing + updater + Node runtime bundling thật (hiện scaffold + build matrix, worker compile TS→JS bằng esbuild, yêu cầu system Node 22+)
+- [ ] Tauri installer signing + updater + Node runtime bundling thật (hiện scaffold + build matrix, worker compile TS→JS bằng esbuild, yêu cầu system Node 22.x)
 - [ ] Production rules enforcement (backend, không chỉ UI)
 - [ ] Tauri desktop distributable: build theo OS matrix, CSP, signing, updater
 - [x] ~~Tauri: worker path mismatch~~ — worker compile TS→JS bằng esbuild (`npm run build:worker`), bundle vào `server/worker/index.js`, main.rs gọi đúng path
-- [x] ~~DB migrations thay vì db:push cho production deploy~~ — `docker-compose.yml` đã chuyển sang `drizzle-kit migrate` (có ledger, ordered, auditable)
-- [ ] Tauri: bundle Node runtime vào installer (hiện yêu cầu system Node 22+, có runtime check + MessageBox trên Windows)
+- [x] ~~DB migrations thay vì db:push cho production deploy~~ — `docker-compose.yml` dùng custom migration runner (`tsx scripts/migrate.ts`) thay vì `drizzle-kit migrate` (silent-fail bug trên PG17) hoặc `drizzle-kit push --force` (bypass ledger). Runner áp dụng SQL files từ `drizzle/` theo thứ tự + ghi ledger. Dockerfile copy `drizzle/` và `scripts/` vào image.
+- [ ] Tauri: bundle Node runtime vào installer (hiện yêu cầu system Node 22.x, có runtime check + MessageBox trên Windows)

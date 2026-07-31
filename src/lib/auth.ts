@@ -266,13 +266,57 @@ export function getPermissionsForRole(role: Role): Permission[] {
   return ROLE_PERMISSIONS[role] ?? [];
 }
 
+/* Parse an IPv4 address into a 32-bit unsigned integer. Returns null for
+   invalid addresses. IPv6 is not supported — if the deployment uses IPv6,
+   configure the proxy to translate to IPv4 or set TRUSTED_PROXY_CIDR to
+   include the IPv6 range (not yet supported, will fall through to null). */
+function parseIpv4(ip: string): number | null {
+  const parts = ip.trim().split(".");
+  if (parts.length !== 4) return null;
+  let result = 0;
+  for (const part of parts) {
+    const octet = Number(part);
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) return null;
+    result = (result << 8) | octet;
+  }
+  return result >>> 0; /* unsigned */
+}
+
+/* Check if an IP is within a CIDR range (e.g. "10.0.0.0/8"). */
+function ipInCidr(ip: string, cidr: string): boolean {
+  const slashIdx = cidr.indexOf("/");
+  const cidrIp = slashIdx >= 0 ? cidr.slice(0, slashIdx) : cidr;
+  const prefixLen = slashIdx >= 0 ? parseInt(cidr.slice(slashIdx + 1), 10) : 32;
+  const ipInt = parseIpv4(ip);
+  const cidrInt = parseIpv4(cidrIp);
+  if (ipInt === null || cidrInt === null) return false;
+  if (prefixLen === 0) return true;
+  const mask = prefixLen >= 32 ? 0xffffffff : (0xffffffff << (32 - prefixLen)) >>> 0;
+  return (ipInt & mask) === (cidrInt & mask);
+}
+
+/* Check if an IP is within any of the comma-separated CIDR ranges. */
+function ipInTrustedCidrs(ip: string, cidrs: string): boolean {
+  return cidrs.split(",").some((cidr) => ipInCidr(ip, cidr.trim()));
+}
+
 export function clientIp(req: Request): string | null {
   /* Only trust x-forwarded-for / x-real-ip when a trusted proxy is
-     configured. Without this, a client can spoof its IP via the header
-     and bypass rate limiting. TRUSTED_PROXY_CIDR is a comma-separated
-     list of CIDR ranges (e.g. "10.0.0.0/8,172.16.0.0/12"). When unset,
-     we DO NOT trust any client-supplied header — a direct client can
-     set x-real-ip / x-forwarded-for to any value to evade rate limits.
+     configured AND the request actually came through that proxy.
+
+     TRUSTED_PROXY_CIDR is a comma-separated list of CIDR ranges (e.g.
+     "10.0.0.0/8,172.16.0.0/12"). The reverse proxy (nginx/Caddy) sets
+     x-real-ip from the actual TCP socket — we validate that x-real-ip
+     falls within the trusted CIDR before trusting x-forwarded-for.
+
+     Without this validation, any value in TRUSTED_PROXY_CIDR acts as a
+     boolean "trust all headers" — a direct client can forge x-real-ip /
+     x-forwarded-for to bypass rate limiting.
+
+     When TRUSTED_PROXY_CIDR is unset, we DO NOT trust any header — a
+     direct client can forge them. Return null so the rate limiter falls
+     back to a single "unknown" bucket. This means all direct clients
+     share one rate-limit bucket — safe (no bypass) but coarse.
 
      NOTE: This in-memory rate limiter is per-instance and resets on
      restart. For multi-instance deployments, use a shared store (Redis)
@@ -280,18 +324,27 @@ export function clientIp(req: Request): string | null {
      is suitable for single-instance / desktop mode only. */
   const trustedProxy = process.env.TRUSTED_PROXY_CIDR;
   if (!trustedProxy) {
-    /* No trusted proxy: do NOT trust x-real-ip or x-forwarded-for.
-       A direct client can forge these headers. Return null so the rate
-       limiter falls back to a single "unknown" bucket — all direct
-       clients share it, which is safe (no bypass possible). */
     return null;
   }
+
+  /* The reverse proxy sets x-real-ip from the TCP socket. Validate it
+     against the trusted CIDR — if it doesn't match, the request didn't
+     come through our proxy and the headers are untrusted. */
+  const xRealIp = req.headers.get("x-real-ip");
+  if (!xRealIp || !ipInTrustedCidrs(xRealIp, trustedProxy)) {
+    /* x-real-ip missing or not from a trusted proxy — don't trust any
+       client-supplied header. */
+    return null;
+  }
+
+  /* The proxy is trusted — take the original client IP from x-forwarded-for
+     (the leftmost entry is the original client, set by the proxy). */
   const xff = req.headers.get("x-forwarded-for");
   if (xff) {
-    /* Trusted proxy: take the leftmost (original client) IP. */
     return xff.split(",")[0]?.trim() ?? null;
   }
-  /* Trusted proxy configured but no x-forwarded-for header — try
-     x-real-ip (set by nginx/Caddy from the actual socket). */
-  return req.headers.get("x-real-ip") ?? null;
+
+  /* No x-forwarded-for — use x-real-ip as the client IP (the proxy set it
+     from the socket, and we already validated it's from a trusted source). */
+  return xRealIp;
 }

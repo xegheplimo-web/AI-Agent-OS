@@ -120,7 +120,10 @@ fn check_node_runtime() -> bool {
         }
     };
 
-    /* Parse "v22.x.x" → major = 22. Reject anything below 22. */
+    /* Parse "v22.x.x" → major = 22. package.json engines requires
+       ">=22 <23", so reject anything below 22 OR >= 23. Node 23+ may
+       have breaking changes that affect the bundled worker (esbuild
+       target=node22) and Next.js standalone server. */
     let major: u32 = version_str
         .strip_prefix('v')
         .unwrap_or(&version_str)
@@ -131,8 +134,19 @@ fn check_node_runtime() -> bool {
 
     if major < 22 {
         let msg = format!(
-            "Node.js {} is too old.\n\nThis app requires Node.js 22+ (found {}).\
-            \nDownload the latest LTS from https://nodejs.org/ and restart the app.",
+            "Node.js {} is too old.\n\nThis app requires Node.js 22.x (found {}).\
+            \nDownload the Node.js 22 LTS from https://nodejs.org/ and restart the app.",
+            version_str, version_str
+        );
+        show_node_error(&msg);
+        return false;
+    }
+
+    if major >= 23 {
+        let msg = format!(
+            "Node.js {} is not supported.\n\nThis app requires Node.js 22.x (found {}).\
+            \nNode 23+ may have breaking changes. Download the Node.js 22 LTS from\
+            \nhttps://nodejs.org/ and restart the app.",
             version_str, version_str
         );
         show_node_error(&msg);

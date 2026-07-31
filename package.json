@@ -18,6 +18,7 @@
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push --force",
     "db:migrate": "drizzle-kit migrate",
+    "db:migrate:run": "tsx scripts/migrate.ts",
     "db:studio": "drizzle-kit studio",
     "db:seed": "tsx src/db/seed.ts",
     "worker": "tsx src/worker/index.ts",
@@ -64,7 +65,7 @@
   },
   "allowScripts": {
     "esbuild@0.18.20": true,
-    "esbuild@0.25.5": true,
+    "esbuild@0.25.12": true,
     "esbuild@0.28.1": true
   }
 }

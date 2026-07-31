@@ -257,7 +257,15 @@ export async function scanPackages(target?: AuditTarget): Promise<ScanResult> {
            npm lockfile v3 has a `packages` object keyed by path like
            "node_modules/foo" or "node_modules/@scope/bar". The root
            package is keyed by "" (empty string). Each entry has `version`
-           and optionally `license` / `licenses`. */
+           and optionally `license` / `licenses`.
+
+           Bug fixes:
+           1. Direct deps previously kept their semver range (e.g. "^5.0.0")
+              because `seen` blocked the lockfile's resolved version. Now we
+              build a name→resolved-version map and update direct deps.
+           2. Nested paths like "node_modules/@foo/bar/node_modules/@baz/qux"
+              were incorrectly stripped to "@foo/bar/node_modules/@baz/qux".
+              Now we extract the real package name from the last node_modules/ segment. */
         const lockPath = path.join(root, "package-lock.json");
         if (existsSync(lockPath)) {
           warnings.push("node_modules absent — using package-lock.json for resolved versions");
@@ -265,19 +273,62 @@ export async function scanPackages(target?: AuditTarget): Promise<ScanResult> {
             packages?: Record<string, { version?: string; license?: string | { type?: string }; licenses?: Array<{ type?: string }>; dev?: boolean; optional?: boolean; link?: boolean }>;
           };
           const packages = lock.packages ?? {};
+
+          /* Extract the canonical package name from a lockfile path.
+             "node_modules/foo" → "foo"
+             "node_modules/@scope/bar" → "@scope/bar"
+             "node_modules/a/node_modules/@scope/b" → "@scope/b" */
+          const extractName = (lockPath: string): string => {
+            const parts = lockPath.split("node_modules/");
+            const last = parts[parts.length - 1];
+            /* Scoped package: last part starts with "@", take 2 segments */
+            if (last.startsWith("@")) {
+              const segs = last.split("/");
+              return segs.slice(0, 2).join("/");
+            }
+            return last.split("/")[0];
+          };
+
+          /* Build a map of canonical name → resolved version + license.
+             For direct deps, the lockfile key is "node_modules/<name>". */
+          const resolvedByName = new Map<string, { version: string; license: string }>();
           for (const [pkgPath, meta] of Object.entries(packages)) {
-            if (!pkgPath || meta.link) continue; /* skip root + symlinks */
-            const name = pkgPath.replace(/^node_modules\//, "");
-            if (seen.has(name)) continue;
-            seen.add(name);
+            if (!pkgPath || meta.link) continue;
+            const name = extractName(pkgPath);
             let lic = "UNKNOWN";
             if (typeof meta.license === "string") lic = meta.license;
             else if (meta.license?.type) lic = meta.license.type;
             else if (meta.licenses?.[0]?.type) lic = meta.licenses[0].type;
+            /* Prefer the shallowest entry (first match wins) — for nested
+               duplicates, the top-level resolution is the canonical one. */
+            if (!resolvedByName.has(name)) {
+              resolvedByName.set(name, { version: meta.version ?? "0.0.0", license: lic });
+            }
+          }
+
+          /* Update direct dependency versions from the lockfile — replace
+             semver ranges with resolved versions. */
+          for (const comp of components) {
+            const resolved = resolvedByName.get(comp.name);
+            if (resolved) {
+              comp.version = resolved.version;
+              if (comp.license === "UNKNOWN" && resolved.license !== "UNKNOWN") {
+                comp.license = resolved.license;
+              }
+            }
+          }
+
+          /* Add transitive dependencies not already in the direct set. */
+          for (const [pkgPath, meta] of Object.entries(packages)) {
+            if (!pkgPath || meta.link) continue;
+            const name = extractName(pkgPath);
+            if (seen.has(name)) continue;
+            seen.add(name);
+            const resolved = resolvedByName.get(name);
             transitiveComponents.push({
               name,
-              version: meta.version ?? "0.0.0",
-              license: lic,
+              version: resolved?.version ?? meta.version ?? "0.0.0",
+              license: resolved?.license ?? "UNKNOWN",
               type: meta.dev ? "development" : "transitive",
             });
           }

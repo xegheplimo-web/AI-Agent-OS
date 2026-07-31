@@ -33,17 +33,17 @@ services:
     profiles: ["demo", "production"]
 
   # --- schema bootstrap (runs once, both profiles) --------------------------
-  # Uses `drizzle-kit migrate` (migration runner with ledger) instead of
-  # `drizzle-kit push --force`. The migration runner applies only pending SQL
-  # files from ./drizzle/ and records each one in the __drizzle_migrations
-  # journal — ensuring ordered, auditable, reproducible schema changes.
-  # `push --force` was a dev convenience that bypassed the ledger and could
-  # silently drift the schema in unpredictable ways.
+  # Uses a custom migration runner (scripts/migrate.ts) instead of
+  # `drizzle-kit migrate` (which has a silent-fail bug on PostgreSQL 17:
+  # applies 0 migrations, exits 1, no error) or `drizzle-kit push --force`
+  # (which bypasses the ledger and can silently drift the schema).
+  # The runner applies SQL files from ./drizzle/ in order and records each
+  # in the __drizzle_migrations ledger — ordered, auditable, reproducible.
   migrate:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["node_modules/.bin/drizzle-kit", "migrate"]
+    command: ["node_modules/.bin/tsx", "scripts/migrate.ts"]
     environment:
       NODE_ENV: production
       DATABASE_URL: postgresql://agent_os:agent_os@postgres:5432/agent_os
