@@ -120,6 +120,41 @@ jobs:
       - name: Re-push schema (after migration verify dropped tables)
         run: npm run db:push
 
+      # Test the custom migration runner (scripts/migrate.ts) on a clean DB.
+      # This verifies the runner works on PostgreSQL 17, creates the ledger,
+      # and applies all migrations. Then run it again to verify idempotency.
+      - name: Test custom migration runner (clean DB + idempotency)
+        run: |
+          # Drop all tables + drizzle schema for a truly clean start
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+            "DROP SCHEMA public CASCADE; CREATE SCHEMA public; DROP SCHEMA IF EXISTS drizzle CASCADE;"
+          # Run the custom migration runner — applies all SQL files + creates ledger
+          npm run db:migrate:run
+          # Verify the ledger has entries
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+            "SELECT count(*) AS migration_count FROM drizzle.__drizzle_migrations;" | grep -v "^-" | tail -1 | xargs -I{} echo "Ledger entries: {}"
+          # Run again — should be idempotent (0 new migrations applied)
+          OUTPUT=$(npm run db:migrate:run 2>&1)
+          echo "$OUTPUT" | grep -q "0 applied" || (echo "::error::Migration runner is not idempotent" && exit 1)
+          echo "Migration runner idempotency test passed."
+
+      # Test baseline adoption: simulate a database that was created by
+      # db:push (has tables but no ledger). The runner should detect this
+      # and mark all migrations as applied without re-running them.
+      - name: Test migration baseline adoption (db:push → migrate runner)
+        run: |
+          # Drop everything, then use db:push to create schema (no ledger)
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+            "DROP SCHEMA public CASCADE; CREATE SCHEMA public; DROP SCHEMA IF EXISTS drizzle CASCADE;"
+          npm run db:push
+          # Verify no ledger exists yet
+          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+            "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE schemaname='drizzle' AND tablename='__drizzle_migrations')" | grep -q "f" && echo "No ledger (expected)" || echo "Ledger exists (unexpected but ok)"
+          # Run the migration runner — should adopt baseline, not fail
+          OUTPUT=$(npm run db:migrate:run 2>&1)
+          echo "$OUTPUT" | grep -q "baseline" || (echo "::error::Baseline adoption not triggered" && exit 1)
+          echo "Baseline adoption test passed."
+
       - name: Seed demo data
         run: npm run db:seed
 
@@ -144,7 +179,15 @@ jobs:
         env:
           APP_MODE: production
 
-      # Verify release artifacts (lockfile, .env.example, Dockerfile, etc.)
+      # Build the worker bundle (TS→JS via esbuild) BEFORE verify:release,
+      # which checks that dist/worker/index.js exists and is importable.
+      # Without this step, clean CI checkout has no dist/ (it's gitignored)
+      # and verify:release fails.
+      - name: Build worker bundle
+        run: npm run build:worker
+
+      # Verify release artifacts (lockfile, .env.example, Dockerfile, worker
+      # bundle, migration files, etc.)
       - name: Verify release readiness
         run: npm run verify:release
 

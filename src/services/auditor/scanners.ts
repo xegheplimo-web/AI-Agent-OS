@@ -259,13 +259,17 @@ export async function scanPackages(target?: AuditTarget): Promise<ScanResult> {
            package is keyed by "" (empty string). Each entry has `version`
            and optionally `license` / `licenses`.
 
-           Bug fixes:
-           1. Direct deps previously kept their semver range (e.g. "^5.0.0")
-              because `seen` blocked the lockfile's resolved version. Now we
-              build a name→resolved-version map and update direct deps.
-           2. Nested paths like "node_modules/@foo/bar/node_modules/@baz/qux"
-              were incorrectly stripped to "@foo/bar/node_modules/@baz/qux".
-              Now we extract the real package name from the last node_modules/ segment. */
+           Key design decisions:
+           1. Track packages by name+version (not name-only) so that
+              multiple versions of the same package in the dependency
+              tree are all reported in the SBOM. This is critical for
+              supply-chain visibility — a vulnerability in foo@1.0.0
+              must not be hidden by foo@2.0.0 also being present.
+           2. For direct deps, pick the shallowest resolved version
+              (the top-level node_modules/<name> entry, not a nested one).
+              We compare path depth, not insertion order.
+           3. Nested paths like "node_modules/@foo/bar/node_modules/@baz/qux"
+              are correctly parsed to extract the real package name. */
         const lockPath = path.join(root, "package-lock.json");
         if (existsSync(lockPath)) {
           warnings.push("node_modules absent — using package-lock.json for resolved versions");
@@ -281,7 +285,6 @@ export async function scanPackages(target?: AuditTarget): Promise<ScanResult> {
           const extractName = (lockPath: string): string => {
             const parts = lockPath.split("node_modules/");
             const last = parts[parts.length - 1];
-            /* Scoped package: last part starts with "@", take 2 segments */
             if (last.startsWith("@")) {
               const segs = last.split("/");
               return segs.slice(0, 2).join("/");
@@ -289,27 +292,35 @@ export async function scanPackages(target?: AuditTarget): Promise<ScanResult> {
             return last.split("/")[0];
           };
 
-          /* Build a map of canonical name → resolved version + license.
-             For direct deps, the lockfile key is "node_modules/<name>". */
-          const resolvedByName = new Map<string, { version: string; license: string }>();
+          /* Count the nesting depth of a lockfile path (number of
+             "node_modules/" segments). Lower = shallower = more canonical. */
+          const pathDepth = (lockPath: string): number =>
+            (lockPath.match(/node_modules\//g) ?? []).length;
+
+          /* Build a map of canonical name → { version, license, depth }
+             for the shallowest resolution of each name. This is used to
+             update direct dependency versions (direct deps resolve to
+             the top-level entry, not a nested one). */
+          const shallowestByName = new Map<string, { version: string; license: string; depth: number }>();
           for (const [pkgPath, meta] of Object.entries(packages)) {
             if (!pkgPath || meta.link) continue;
             const name = extractName(pkgPath);
+            const depth = pathDepth(pkgPath);
             let lic = "UNKNOWN";
             if (typeof meta.license === "string") lic = meta.license;
             else if (meta.license?.type) lic = meta.license.type;
             else if (meta.licenses?.[0]?.type) lic = meta.licenses[0].type;
-            /* Prefer the shallowest entry (first match wins) — for nested
-               duplicates, the top-level resolution is the canonical one. */
-            if (!resolvedByName.has(name)) {
-              resolvedByName.set(name, { version: meta.version ?? "0.0.0", license: lic });
+            const existing = shallowestByName.get(name);
+            /* Keep the shallowest entry — compare depth, not insertion order. */
+            if (!existing || depth < existing.depth) {
+              shallowestByName.set(name, { version: meta.version ?? "0.0.0", license: lic, depth });
             }
           }
 
           /* Update direct dependency versions from the lockfile — replace
-             semver ranges with resolved versions. */
+             semver ranges with the shallowest resolved version. */
           for (const comp of components) {
-            const resolved = resolvedByName.get(comp.name);
+            const resolved = shallowestByName.get(comp.name);
             if (resolved) {
               comp.version = resolved.version;
               if (comp.license === "UNKNOWN" && resolved.license !== "UNKNOWN") {
@@ -318,17 +329,29 @@ export async function scanPackages(target?: AuditTarget): Promise<ScanResult> {
             }
           }
 
-          /* Add transitive dependencies not already in the direct set. */
+          /* Add ALL transitive dependencies, tracking by name+version
+             (not name-only) so multiple versions of the same package
+             are all included in the SBOM. This is critical for supply-chain
+             accuracy — if foo@1.0.0 and foo@2.0.0 both appear in the tree,
+             both must be reported. */
+          const seenNameVersion = new Set(
+            components.map((c) => `${c.name}@${c.version}`),
+          );
           for (const [pkgPath, meta] of Object.entries(packages)) {
             if (!pkgPath || meta.link) continue;
             const name = extractName(pkgPath);
-            if (seen.has(name)) continue;
-            seen.add(name);
-            const resolved = resolvedByName.get(name);
+            const version = meta.version ?? "0.0.0";
+            const key = `${name}@${version}`;
+            if (seenNameVersion.has(key)) continue;
+            seenNameVersion.add(key);
+            let lic = "UNKNOWN";
+            if (typeof meta.license === "string") lic = meta.license;
+            else if (meta.license?.type) lic = meta.license.type;
+            else if (meta.licenses?.[0]?.type) lic = meta.licenses[0].type;
             transitiveComponents.push({
               name,
-              version: resolved?.version ?? meta.version ?? "0.0.0",
-              license: resolved?.license ?? "UNKNOWN",
+              version,
+              license: lic,
               type: meta.dev ? "development" : "transitive",
             });
           }
