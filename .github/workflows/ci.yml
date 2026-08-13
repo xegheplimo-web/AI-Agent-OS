@@ -75,19 +75,19 @@ jobs:
             echo "::error::No drizzle/*.sql migration files found — run 'npm run db:generate' before release." && exit 1
           fi
           # Drop all tables so migrations start from an empty schema.
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+          psql "$DATABASE_URL" -c \
             "DO \$\$ DECLARE r RECORD; BEGIN FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.tablename) || ' CASCADE'; END LOOP; END \$\$;" >/dev/null
           # Apply each migration file in lexical (chronological) order.
           for f in $(find drizzle -maxdepth 1 -name '*.sql' | sort); do
             echo "Applying $f ..."
-            PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -v ON_ERROR_STOP=1 -f "$f" >/dev/null \
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" >/dev/null \
               || { echo "::error::$f failed to apply"; exit 1; }
           done
           # Sanity: a core table created by the migrations must exist.
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c "\dt public.audits" | grep -q audits \
+          psql "$DATABASE_URL" -c "\dt public.audits" | grep -q audits \
             || (echo "::error::migrations did not create the audits table" && exit 1)
           # Sanity: the active-audit singleton index exists.
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c "\di public.audits_active_uidx" | grep -q audits_active_uidx \
+          psql "$DATABASE_URL" -c "\di public.audits_active_uidx" | grep -q audits_active_uidx \
             || (echo "::error::migrations did not create the audits_active_uidx index" && exit 1)
           echo "All $(find drizzle -maxdepth 1 -name '*.sql' | wc -l) migration files applied successfully."
 
@@ -98,19 +98,19 @@ jobs:
       - name: Verify migration upgrade (old schema → latest)
         run: |
           # Start fresh: drop everything
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+          psql "$DATABASE_URL" -c \
             "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
           # Apply all migrations EXCEPT the latest (0010)
           for f in $(find drizzle -maxdepth 1 -name '*.sql' | sort | head -n -1); do
-            PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -v ON_ERROR_STOP=1 -f "$f" >/dev/null \
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" >/dev/null \
               || (echo "::error::Upgrade test: migration $f failed on old schema" && exit 1)
           done
           # Insert a row that the latest migration might ALTER (e.g. telemetry_points)
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+          psql "$DATABASE_URL" -c \
             "INSERT INTO telemetry_points (metric, value, ts) VALUES ('latency_p95', 128.0, now());"
           # Now apply the latest migration on top — this is the upgrade path
           LATEST=$(find drizzle -maxdepth 1 -name '*.sql' | sort | tail -1)
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -v ON_ERROR_STOP=1 -f "$LATEST" >/dev/null \
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$LATEST" >/dev/null \
             || (echo "::error::Upgrade test: latest migration $LATEST failed on existing data" && exit 1)
           echo "Upgrade test passed: $LATEST applied on top of old schema + existing data."
 
@@ -126,12 +126,12 @@ jobs:
       - name: Test custom migration runner (clean DB + idempotency)
         run: |
           # Drop all tables + drizzle schema for a truly clean start
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+          psql "$DATABASE_URL" -c \
             "DROP SCHEMA public CASCADE; CREATE SCHEMA public; DROP SCHEMA IF EXISTS drizzle CASCADE;"
           # Run the custom migration runner — applies all SQL files + creates ledger
           npm run db:migrate:run
           # Verify the ledger has entries
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+          psql "$DATABASE_URL" -c \
             "SELECT count(*) AS migration_count FROM drizzle.__drizzle_migrations;" | grep -v "^-" | tail -1 | xargs -I{} echo "Ledger entries: {}"
           # Run again — should be idempotent (0 new migrations applied)
           OUTPUT=$(npm run db:migrate:run 2>&1)
@@ -144,11 +144,11 @@ jobs:
       - name: Test migration baseline adoption (db:push → migrate runner)
         run: |
           # Drop everything, then use db:push to create schema (no ledger)
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+          psql "$DATABASE_URL" -c \
             "DROP SCHEMA public CASCADE; CREATE SCHEMA public; DROP SCHEMA IF EXISTS drizzle CASCADE;"
           npm run db:push
           # Verify no ledger exists yet
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+          psql "$DATABASE_URL" -c \
             "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE schemaname='drizzle' AND tablename='__drizzle_migrations')" | grep -q "f" && echo "No ledger (expected)" || echo "Ledger exists (unexpected but ok)"
           # Run the migration runner — should adopt baseline, not fail
           OUTPUT=$(npm run db:migrate:run 2>&1)
@@ -275,19 +275,19 @@ jobs:
       - run: npm ci
       - run: npm run build
       # Tauri requires Rust + system deps (Linux only)
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         if: matrix.platform == 'ubuntu-latest'
       - name: Install Linux deps
         if: matrix.platform == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         if: matrix.platform != 'ubuntu-latest'
       - name: Verify tauri.conf.json is valid
-        run: npx tauri info
+        run: npm exec -- tauri info
       - name: Build Tauri installer (${{ matrix.bundles }})
-        run: npx tauri build --bundles ${{ matrix.bundles }}
+        run: npm exec -- tauri build --bundles ${{ matrix.bundles }}
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:

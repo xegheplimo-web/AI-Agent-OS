@@ -150,7 +150,7 @@ async function main() {
 
        On Windows, ESM import requires a file:// URL, not a bare path. */
     const workerUrl = pathToFileURL(workerBundlePath).href;
-    const result = spawnSync("node", ["-e", `
+    const result = spawnSync(process.execPath, ["-e", `
       import("${workerUrl}")
         .then((mod) => {
           /* If the module exports a main function, don't call it — we just
@@ -162,10 +162,9 @@ async function main() {
     `], {
       timeout: 10000,
       stdio: "pipe",
-      env: { ...process.env, DATABASE_URL: "", NODE_ENV: "test" },
+      env: { PATH: "/usr/local/bin:/usr/bin:/bin", DATABASE_URL: "", NODE_ENV: "test" },
     });
     const stderr = result.stderr?.toString() ?? "";
-    const stdout = result.stdout?.toString() ?? "";
     /* Accept exit 0 (clean load) — a worker that tries to connect to DB
        with empty DATABASE_URL may exit with non-zero, but if the error
        is a DB connection error (not a syntax/import error), that's OK. */
