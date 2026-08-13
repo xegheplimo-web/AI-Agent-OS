@@ -27,6 +27,7 @@
     "verify:worker": "tsx scripts/verify-worker.ts",
     "verify:release": "tsx scripts/verify-release.ts",
     "verify:executors": "tsx scripts/verify-executors.ts",
+    "tauri": "tauri",
     "icons": "node scripts/generate-icons.mjs"
   },
   "dependencies": {

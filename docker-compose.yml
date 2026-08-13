@@ -19,7 +19,7 @@ services:
     image: postgres:17
     environment:
       POSTGRES_USER: agent_os
-      POSTGRES_PASSWORD: agent_os
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agent_os}
       POSTGRES_DB: agent_os
     ports:
       - "5432:5432"

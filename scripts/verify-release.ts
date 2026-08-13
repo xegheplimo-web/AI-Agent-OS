@@ -14,9 +14,8 @@ import "dotenv/config";
  *   8. drizzle/ directory has .sql migration files
  *
  * Exit 0 only if every check passed. */
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -57,7 +56,7 @@ async function main() {
        their own entries — this is a shallow tree check (not full npm
        resolution, but catches the most common sync issues). */
     const lockPackages = (lock.packages ?? {}) as Record<string, { version?: string; dependencies?: Record<string, string>; devDependencies?: Record<string, string> }>;
-    const allDeps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+    const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
     const missingInLock: string[] = [];
     const versionMismatch: string[] = [];
     for (const [depName, range] of Object.entries(allDeps) as [string, string][]) {
@@ -71,14 +70,19 @@ async function main() {
          Simple check: if range is an exact version, it must match.
          For ranges (^, ~, >=), we do a basic major-version check. */
       if (lockEntry.version) {
-        const rangeMajor = range.match(/\d+/)?.[0];
+        const rangeMajor = /\d+/.exec(range)?.[0];
         const lockMajor = lockEntry.version.split(".")[0];
         if (rangeMajor && lockMajor && rangeMajor !== lockMajor && !range.startsWith(">=") && !range.includes("||")) {
           versionMismatch.push(`${depName}: range ${range} vs lock ${lockEntry.version}`);
         }
       }
     }
-    check("all package.json deps have lockfile entries (npm ci tree sync)", missingInLock.length === 0, missingInLock.length ? `missing: ${missingInLock.slice(0, 5).join(", ")}${missingInLock.length > 5 ? "…" : ""}` : `${Object.keys(allDeps).length} deps verified`);
+    {
+      const missingDetail = missingInLock.length
+        ? `missing: ${missingInLock.slice(0, 5).join(", ")}${missingInLock.length > 5 ? "…" : ""}`
+        : `${Object.keys(allDeps).length} deps verified`;
+      check("all package.json deps have lockfile entries (npm ci tree sync)", missingInLock.length === 0, missingDetail);
+    }
     check("lockfile versions satisfy package.json ranges", versionMismatch.length === 0, versionMismatch.length ? versionMismatch.slice(0, 3).join("; ") : "all ranges satisfied");
   }
 
