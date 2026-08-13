@@ -5,7 +5,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:3000",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build && npm run build:worker",
     "frontendDist": "http://127.0.0.1:3000"
   },
   "app": {
@@ -24,7 +24,7 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:3000 ws://127.0.0.1:3000; frame-src 'self'",
       "dangerousDisableAssetCspModification": false
     }
   },
@@ -34,7 +34,15 @@
     "resources": {
       "../.next/standalone": "server/",
       "../.next/static": "server/.next/static/",
-      "../public": "server/public/"
+      "../public": "server/public/",
+      "../dist/worker": "server/worker/",
+      "../src/services": "server/src/services/",
+      "../src/db": "server/src/db/",
+      "../src/lib": "server/src/lib/",
+      "../drizzle": "server/drizzle/",
+      "../package.json": "server/package.json",
+      "../package-lock.json": "server/package-lock.json",
+      "../drizzle.config.ts": "server/drizzle.config.ts"
     },
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico", "icons/icon.icns"]
   }

@@ -178,7 +178,7 @@ export function TopHeader() {
           <kbd className="hidden rounded border border-ink/15 bg-ink/5 px-1 py-0.5 font-mono text-[8.5px] lg:inline">Ctrl K</kbd>
         </button>
 
-        <div className="glass-soft flex size-9 items-center justify-center rounded-xl text-mint" title="Zero-mutation policy enforced">
+        <div className="glass-soft flex size-9 items-center justify-center rounded-xl text-mint" title="Zero-mutation policy configured (backend enforcement in roadmap)">
           <ShieldCheck className="size-4.5" strokeWidth={2} />
         </div>
 

@@ -157,7 +157,7 @@ async function main() {
     ["error_rate", 0.22, 0.14],
     ["queue_depth", 21, 6],
   ];
-  const points: Array<{ metric: string; value: number; ts: Date }> = [];
+  const points: Array<{ metric: string; value: number; ts: Date; source: string }> = [];
   for (let i = 30; i >= 0; i--) {
     const ts = new Date(now - i * 5 * 60 * 1000);
     for (const [metric, base, noise] of metrics) {
@@ -168,7 +168,10 @@ async function main() {
         metric === "error_rate" || metric.startsWith("latency")
           ? Math.round((base + wave + r) * 10) / 10
           : Math.round(base + wave + r);
-      points.push({ metric, value: Math.max(metric === "error_rate" ? 0.02 : 1, v), ts });
+      /* source="manual" so the telemetry summary does NOT label seed data
+         as "otlp" or "synthetic". "manual" is honest: this was inserted by
+         the seed script, not a real collector or the demo sampler. */
+      points.push({ metric, value: Math.max(metric === "error_rate" ? 0.02 : 1, v), ts, source: "manual" });
     }
   }
   await db.insert(schema.telemetryPoints).values(points);

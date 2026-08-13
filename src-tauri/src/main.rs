@@ -94,7 +94,102 @@ fn audit_target_root(app: &tauri::AppHandle) -> String {
         .unwrap_or_else(|_| ".".into())
 }
 
+/// Check that the system `node` binary is available AND is Node 22+.
+/// The Tauri installer does NOT bundle Node — it requires Node 22+ to be
+/// installed on the host system (per package.json `engines.node`).
+///
+/// Without this check, a missing or too-old Node produces a cryptic spawn
+/// error. With it, the user gets a clear message. On Windows the console is
+/// hidden (windows_subsystem = "windows"), so stderr is unreachable — we
+/// show a native MessageBox dialog instead.
+fn check_node_runtime() -> bool {
+    let output = Command::new("node")
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    let version_str = match output {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        _ => {
+            let msg = "Node.js was not found on PATH.\n\nThis app requires Node.js 22+ to be installed on the system.\nDownload it from https://nodejs.org/ and restart the app.";
+            show_node_error(msg);
+            return false;
+        }
+    };
+
+    /* Parse "v22.x.x" → major = 22. package.json engines requires
+       ">=22 <23", so reject anything below 22 OR >= 23. Node 23+ may
+       have breaking changes that affect the bundled worker (esbuild
+       target=node22) and Next.js standalone server. */
+    let major: u32 = version_str
+        .strip_prefix('v')
+        .unwrap_or(&version_str)
+        .split('.')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    if major < 22 {
+        let msg = format!(
+            "Node.js {} is too old.\n\nThis app requires Node.js 22.x (found {}).\
+            \nDownload the Node.js 22 LTS from https://nodejs.org/ and restart the app.",
+            version_str, version_str
+        );
+        show_node_error(&msg);
+        return false;
+    }
+
+    if major >= 23 {
+        let msg = format!(
+            "Node.js {} is not supported.\n\nThis app requires Node.js 22.x (found {}).\
+            \nNode 23+ may have breaking changes. Download the Node.js 22 LTS from\
+            \nhttps://nodejs.org/ and restart the app.",
+            version_str, version_str
+        );
+        show_node_error(&msg);
+        return false;
+    }
+
+    true
+}
+
+/// Show a Node prerequisite error to the user. On Windows the app has no
+/// console (windows_subsystem = "windows"), so eprintln goes nowhere — we use
+/// a native Win32 MessageBox via the `windows_subsystem` attribute. On other
+/// platforms, stderr is visible so we print there.
+fn show_node_error(msg: &str) {
+    eprintln!("[shell] ERROR: {}", msg.replace('\n', " "));
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::CString;
+        if let Ok(c_msg) = CString::new(msg) {
+            if let Ok(c_title) = CString::new("AI Agent OS — Node.js Required") {
+                extern "C" {
+                    fn MessageBoxA(
+                        hwnd: *mut std::ffi::c_void,
+                        lp_text: *const i8,
+                        lp_caption: *const i8,
+                        u_type: u32,
+                    ) -> i32;
+                }
+                unsafe {
+                    MessageBoxA(
+                        std::ptr::null_mut(),
+                        c_msg.as_ptr(),
+                        c_title.as_ptr(),
+                        0x10, /* MB_ICONERROR */
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn spawn_server(app: &tauri::AppHandle, port: u16) -> Option<Child> {
+    if !check_node_runtime() { return None; }
     let server_js = resource(app, "server/server.js")?;
     println!("[shell] starting control plane on :{port} → {server_js:?}");
     Command::new("node")
@@ -118,6 +213,7 @@ fn spawn_worker(app: &tauri::AppHandle) -> Option<Child> {
         println!("[shell] demo mode: no worker sidecar (inline engine owns the queue)");
         return None;
     }
+    if !check_node_runtime() { return None; }
     let worker = resource(app, "server/worker/index.js")?;
     println!("[shell] starting worker sidecar → {worker:?}");
     Command::new("node")

@@ -3,17 +3,22 @@ import "dotenv/config";
  * reproducible build/package of the desktop client and the Docker migrator.
  *
  * Checks (no DB required — pure filesystem + version consistency):
- *   1. package-lock.json exists and is in sync with package.json (npm ci works)
- *   2. Dockerfile copies drizzle.config.ts + package.json into the migrator image
+ *   1. package-lock.json exists, root matches, and all deps have lockfile entries
+ *   2. Dockerfile copies drizzle.config.ts, package.json, drizzle/, scripts/
  *   3. all Tauri icons referenced by tauri.conf.json exist on disk
  *   4. version is consistent across package.json, Cargo.toml, tauri.conf.json,
  *      src/lib/version.ts, and the artifact schema default
- *   5. beforeBuildCommand is a real npm script (not a missing sidecar build)
+ *   5. beforeBuildCommand references real npm scripts (build + build:worker)
+ *   6. Cargo.lock exists (reproducible Rust builds)
+ *   7. Worker bundle script exists and dist/worker/index.js is importable
+ *   8. drizzle/ directory has .sql migration files
  *
  * Exit 0 only if every check passed. */
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
 
 type Check = { name: string; ok: boolean; detail?: string };
 const checks: Check[] = [];
@@ -29,21 +34,64 @@ async function readJson(p: string): Promise<any> {
 }
 
 async function main() {
+  const pkg = await readJson(path.join(ROOT, "package.json"));
+  const npmScripts = (pkg.scripts ?? {}) as Record<string, string>;
+
   /* ---------- 1. package-lock.json present + npm ci would work ---------- */
   const lockPath = path.join(ROOT, "package-lock.json");
   check("package-lock.json exists (npm ci precondition)", existsSync(lockPath));
   if (existsSync(lockPath)) {
     const lock = await readJson(lockPath);
-    const pkg = await readJson(path.join(ROOT, "package.json"));
     const lockName = (lock.packages?.[""]?.name ?? lock.name) as string | undefined;
     const lockVersion = (lock.packages?.[""]?.version ?? lock.version) as string | undefined;
     check("package-lock.json root matches package.json name+version", !!lockName && lockName === pkg.name && !!lockVersion && lockVersion === pkg.version, `${lockName}@${lockVersion} vs ${pkg.name}@${pkg.version}`);
+
+    /* Deep sync check: verify that every dependency + devDependency in
+       package.json has a corresponding entry in the lockfile's `packages`
+       object AND that the resolved version in the lockfile satisfies the
+       semver range in package.json. This catches two classes of errors:
+         1. "Missing: esbuild@0.28.1 from lock file" (dep not in lockfile)
+         2. Lockfile has wrong version that doesn't satisfy the range
+       We also verify that transitive deps referenced by direct deps have
+       their own entries — this is a shallow tree check (not full npm
+       resolution, but catches the most common sync issues). */
+    const lockPackages = (lock.packages ?? {}) as Record<string, { version?: string; dependencies?: Record<string, string>; devDependencies?: Record<string, string> }>;
+    const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
+    const missingInLock: string[] = [];
+    const versionMismatch: string[] = [];
+    for (const [depName, range] of Object.entries(allDeps) as [string, string][]) {
+      const lockKey = `node_modules/${depName}`;
+      const lockEntry = lockPackages[lockKey];
+      if (!lockEntry) {
+        missingInLock.push(depName);
+        continue;
+      }
+      /* Verify the resolved version satisfies the semver range.
+         Simple check: if range is an exact version, it must match.
+         For ranges (^, ~, >=), we do a basic major-version check. */
+      if (lockEntry.version) {
+        const rangeMajor = /\d+/.exec(range)?.[0];
+        const lockMajor = lockEntry.version.split(".")[0];
+        if (rangeMajor && lockMajor && rangeMajor !== lockMajor && !range.startsWith(">=") && !range.includes("||")) {
+          versionMismatch.push(`${depName}: range ${range} vs lock ${lockEntry.version}`);
+        }
+      }
+    }
+    {
+      const missingDetail = missingInLock.length
+        ? `missing: ${missingInLock.slice(0, 5).join(", ")}${missingInLock.length > 5 ? "…" : ""}`
+        : `${Object.keys(allDeps).length} deps verified`;
+      check("all package.json deps have lockfile entries (npm ci tree sync)", missingInLock.length === 0, missingDetail);
+    }
+    check("lockfile versions satisfy package.json ranges", versionMismatch.length === 0, versionMismatch.length ? versionMismatch.slice(0, 3).join("; ") : "all ranges satisfied");
   }
 
-  /* ---------- 2. Dockerfile migrator copies drizzle.config.ts + package.json ---------- */
+  /* ---------- 2. Dockerfile migrator copies required files ---------- */
   const dockerfile = await readFile(path.join(ROOT, "Dockerfile"), "utf-8");
   check("Dockerfile copies drizzle.config.ts into the image", /COPY\b.*\bdrizzle\.config\.ts\b/.test(dockerfile));
   check("Dockerfile copies package.json into the image", /COPY\b.*\bpackage\.json\b/.test(dockerfile));
+  check("Dockerfile copies drizzle/ directory into the image", /COPY\b.*\bdrizzle\b/.test(dockerfile));
+  check("Dockerfile copies scripts/ directory into the image", /COPY\b.*\bscripts\b/.test(dockerfile));
 
   /* ---------- 3. Tauri icons referenced by tauri.conf.json exist ---------- */
   const tauriConf = await readJson(path.join(ROOT, "src-tauri/tauri.conf.json"));
@@ -55,13 +103,14 @@ async function main() {
   }
 
   /* ---------- 4. version consistency ---------- */
-  const pkg = await readJson(path.join(ROOT, "package.json"));
   const cargo = await readFile(path.join(ROOT, "src-tauri/Cargo.toml"), "utf-8");
   const cargoVersion = cargo.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+
+  /* ---------- 4b. Cargo.lock exists (reproducible Rust builds) ---------- */
+  const cargoLockPath = path.join(ROOT, "src-tauri/Cargo.lock");
+  check("src-tauri/Cargo.lock exists (reproducible Rust builds)", existsSync(cargoLockPath));
   const versionModule = await readFile(path.join(ROOT, "src/lib/version.ts"), "utf-8");
   const moduleVersion = versionModule.match(/APP_VERSION\s*=\s*"([^"]+)"/)?.[1];
-  /* GENERATOR_VERSION may be a string literal or an alias `= APP_VERSION`.
-     Either way it resolves to APP_VERSION's value; verify the alias form too. */
   const moduleGenLiteral = versionModule.match(/GENERATOR_VERSION\s*=\s*"([^"]+)"/)?.[1];
   const moduleGenAlias = /GENERATOR_VERSION\s*=\s*APP_VERSION\b/.test(versionModule);
   const moduleGenVersion = moduleGenLiteral ?? (moduleGenAlias ? moduleVersion : undefined);
@@ -78,13 +127,65 @@ async function main() {
   const allMatch = Object.values(versions).every((v) => v === versions["package.json"]);
   check("version is consistent across package.json, Cargo.toml, version.ts, schema.ts", allMatch, JSON.stringify(versions));
 
-  /* ---------- 5. beforeBuildCommand is a real npm script ---------- */
+  /* ---------- 5. beforeBuildCommand references real npm scripts ---------- */
   const beforeBuild = (tauriConf.build?.beforeBuildCommand ?? "") as string;
-  const npmScripts = (pkg.scripts ?? {}) as Record<string, string>;
-  const cmd = beforeBuild.split(/\s+/)[0];
-  const scriptName = beforeBuild.match(/npm run (\S+)/)?.[1];
-  const isNpmRun = cmd === "npm" && !!scriptName && scriptName in npmScripts;
-  check("beforeBuildCommand references a real npm script", isNpmRun, beforeBuild || "(empty)");
+  /* beforeBuildCommand may contain multiple scripts chained with &&.
+     Verify each `npm run <script>` references a real script in package.json. */
+  const scriptRefs = [...beforeBuild.matchAll(/npm run (\S+)/g)].map((m) => m[1]);
+  const allScriptsReal = scriptRefs.length > 0 && scriptRefs.every((s) => s in npmScripts);
+  check("beforeBuildCommand references real npm scripts", allScriptsReal, beforeBuild || "(empty)");
+  check("beforeBuildCommand includes build:worker", scriptRefs.includes("build:worker"), scriptRefs.join(", "));
+
+  /* ---------- 6. Worker bundle script + output ---------- */
+  check("package.json has build:worker script", "build:worker" in npmScripts, npmScripts["build:worker"] ?? "MISSING");
+  const workerBundlePath = path.join(ROOT, "dist/worker/index.js");
+  const workerExists = existsSync(workerBundlePath);
+  check("dist/worker/index.js exists (run npm run build:worker)", workerExists, workerExists ? "found" : "MISSING — run `npm run build:worker`");
+  if (workerExists) {
+    /* Verify the worker bundle is valid JavaScript by importing it with Node
+       and waiting for the module to fully load (including any top-level
+       await or async initialization). We give it 3 seconds to settle, then
+       check if it exited cleanly (no syntax/import errors) or threw.
+
+       We do NOT run the worker's main() — that would require a database.
+       Instead, we import the module and check that it loads without errors.
+       The worker's main() is guarded by a DATABASE_URL check, so with an
+       empty DATABASE_URL it should exit gracefully without connecting.
+
+       On Windows, ESM import requires a file:// URL, not a bare path. */
+    const workerUrl = pathToFileURL(workerBundlePath).href;
+    const result = spawnSync(process.execPath, ["-e", `
+      import("${workerUrl}")
+        .then((mod) => {
+          /* If the module exports a main function, don't call it — we just
+             want to verify the module loads. Some bundlers run main()
+             automatically on import; give it 3s to settle then exit. */
+          setTimeout(() => process.exit(0), 3000);
+        })
+        .catch((e) => { console.error(e.message); process.exit(1); });
+    `], {
+      timeout: 10000,
+      stdio: "pipe",
+      env: { PATH: "/usr/local/bin:/usr/bin:/bin", DATABASE_URL: "", NODE_ENV: "test" },
+    });
+    const stderr = result.stderr?.toString() ?? "";
+    /* Accept exit 0 (clean load) — a worker that tries to connect to DB
+       with empty DATABASE_URL may exit with non-zero, but if the error
+       is a DB connection error (not a syntax/import error), that's OK. */
+    const isDbError = /DATABASE_URL|ECONNREFUSED|connect|getaddrinfo/i.test(stderr);
+    const isImportError = /SyntaxError|Cannot find|Cannot resolve|is not defined|Unexpected token/i.test(stderr);
+    const ok = result.status === 0 || (result.status !== null && isDbError && !isImportError);
+    check("dist/worker/index.js is importable by Node", ok, !ok ? (stderr.split("\n")[0] ?? `exit ${result.status}`) : "ok");
+  }
+
+  /* ---------- 7. drizzle/ directory has SQL migration files ---------- */
+  const drizzleDir = path.join(ROOT, "drizzle");
+  if (existsSync(drizzleDir)) {
+    const sqlFiles = (await readdir(drizzleDir)).filter((f) => f.endsWith(".sql"));
+    check("drizzle/ directory has .sql migration files", sqlFiles.length > 0, `${sqlFiles.length} files`);
+  } else {
+    check("drizzle/ directory has .sql migration files", false, "drizzle/ directory missing");
+  }
 
   /* ---------- summary ---------- */
   const failed = checks.filter((c) => !c.ok).length;

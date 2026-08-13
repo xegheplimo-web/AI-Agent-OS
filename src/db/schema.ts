@@ -178,6 +178,13 @@ export const telemetryPoints = pgTable("telemetry_points", {
   metric: text("metric").notNull(), // latency_p95 | latency_p50 | throughput | error_rate | queue_depth
   value: real("value").notNull(),
   ts: timestamp("ts", { withTimezone: true }).defaultNow().notNull(),
+  /* Provenance: how this data point was collected.
+     - "synthetic": demo random-walk sampler (never in production)
+     - "otlp": real OTLP collector ingestion (not yet implemented — placeholder)
+     - "manual": seed data or manual insert
+     Without this column, the summary API inferred "otlp" from "has data +
+     production mode", which falsely labeled seed/demo data as live OTLP. */
+  source: text("source").notNull().default("manual"),
 }, (t) => [
   index("telemetry_metric_ts_idx").on(t.metric, t.ts),
   index("telemetry_ts_idx").on(t.ts),
@@ -337,6 +344,15 @@ export const approvals = pgTable("approvals", {
 }, (t) => [
   index("approvals_status_idx").on(t.status),
   index("approvals_requested_at_idx").on(t.requestedAt),
+  /* Idempotency: only one pending approval per (actionType, targetId).
+     Without this, finalize could create multiple pending "artifact.package"
+     approvals for the same audit (e.g. if the engine retries), and the
+     approver wouldn't know which one to decide. The partial index only
+     constrains rows where status='pending' — decided approvals are
+     unconstrained so history is preserved. */
+  uniqueIndex("approvals_pending_unique_uidx")
+    .on(t.actionType, t.targetId)
+    .where(sql`status = 'pending'`),
 ]);
 
 /* ------------------------------------------------------------------ */

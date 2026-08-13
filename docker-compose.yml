@@ -19,7 +19,7 @@ services:
     image: postgres:17
     environment:
       POSTGRES_USER: agent_os
-      POSTGRES_PASSWORD: agent_os
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agent_os}
       POSTGRES_DB: agent_os
     ports:
       - "5432:5432"
@@ -33,11 +33,17 @@ services:
     profiles: ["demo", "production"]
 
   # --- schema bootstrap (runs once, both profiles) --------------------------
+  # Uses a custom migration runner (scripts/migrate.ts) instead of
+  # `drizzle-kit migrate` (which has a silent-fail bug on PostgreSQL 17:
+  # applies 0 migrations, exits 1, no error) or `drizzle-kit push --force`
+  # (which bypasses the ledger and can silently drift the schema).
+  # The runner applies SQL files from ./drizzle/ in order and records each
+  # in the __drizzle_migrations ledger — ordered, auditable, reproducible.
   migrate:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["node_modules/.bin/drizzle-kit", "push", "--force"]
+    command: ["node_modules/.bin/tsx", "scripts/migrate.ts"]
     environment:
       NODE_ENV: production
       DATABASE_URL: postgresql://agent_os:agent_os@postgres:5432/agent_os
@@ -83,8 +89,8 @@ services:
       APP_MODE: demo
       NEXT_PUBLIC_APP_MODE: demo
       DATABASE_URL: postgresql://agent_os:agent_os@postgres:5432/agent_os
-      API_INTERNAL_TOKEN: ${API_INTERNAL_TOKEN:?must be set — generate with: openssl rand -hex 32}
-      SESSION_SECRET: ${SESSION_SECRET:?must be set — generate with: openssl rand -hex 32}
+      API_INTERNAL_TOKEN: ${API_INTERNAL_TOKEN:?set via env or .env file}
+      SESSION_SECRET: ${SESSION_SECRET:?set via env or .env file}
     ports:
       - "3000:3000"
     depends_on:
@@ -107,9 +113,9 @@ services:
       APP_MODE: production
       NEXT_PUBLIC_APP_MODE: production
       DATABASE_URL: postgresql://agent_os:agent_os@postgres:5432/agent_os
-      AUDITOR_SERVICE_TOKEN: ${AUDITOR_SERVICE_TOKEN:?must be set — generate with: openssl rand -hex 32}
-      WORKER_SERVICE_TOKEN: ${WORKER_SERVICE_TOKEN:?must be set — generate with: openssl rand -hex 32}
-      SESSION_SECRET: ${SESSION_SECRET:?must be set — generate with: openssl rand -hex 32}
+      AUDITOR_SERVICE_TOKEN: ${AUDITOR_SERVICE_TOKEN:?set via env or .env file}
+      WORKER_SERVICE_TOKEN: ${WORKER_SERVICE_TOKEN:?set via env or .env file}
+      SESSION_SECRET: ${SESSION_SECRET:?set via env or .env file}
     ports:
       - "3000:3000"
     depends_on:
@@ -133,7 +139,19 @@ services:
       NODE_ENV: production
       APP_MODE: production
       DATABASE_URL: postgresql://agent_os:agent_os@postgres:5432/agent_os
-      WORKER_SERVICE_TOKEN: ${WORKER_SERVICE_TOKEN:?must be set — generate with: openssl rand -hex 32}
+      WORKER_SERVICE_TOKEN: ${WORKER_SERVICE_TOKEN:?set via env or .env file}
+      # Production audit target — the worker scans THIS root, not its own
+      # checkout. Without it, resolveTarget() marks the target invalid and
+      # every root-backed scanner fail-closes (no false-green on worker's
+      # own node_modules). Mount the target read-only below.
+      AUDIT_TARGET_ROOT_PRODUCTION: ${AUDIT_TARGET_ROOT_PRODUCTION:-/audit-target}
+      TARGET_DATABASE_URL_PRODUCTION: ${TARGET_DATABASE_URL_PRODUCTION:-}
+      TARGET_RUNTIME_ENDPOINT_PRODUCTION: ${TARGET_RUNTIME_ENDPOINT_PRODUCTION:-}
+    volumes:
+      # Mount the audit target repository read-only so the worker can scan
+      # it but never modify it. The host path is configurable via env or
+      # .env file; default is a named volume for smoke testing.
+      - ${AUDIT_TARGET_HOST_PATH:-audit-target-data}:/audit-target:ro
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -146,3 +164,7 @@ services:
 
 volumes:
   postgres-data:
+  # Default target volume for smoke testing. In production, set
+  # AUDIT_TARGET_HOST_PATH in .env to the host path of the repository
+  # you want to audit (e.g. /home/repos/my-app).
+  audit-target-data:

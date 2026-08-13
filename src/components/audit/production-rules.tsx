@@ -51,9 +51,9 @@ export function ProductionRules() {
               <span className="flex-1 text-[12.5px] text-ink/90">{r.label}</span>
               <span
                 className="font-mono text-[9px] tracking-[0.18em] uppercase"
-                style={{ color: r.enabled ? "#20e3a2" : "#7890aa" }}
+                style={{ color: r.enabled ? "#37d6ff" : "#7890aa" }}
               >
-                {r.enabled ? "enforced" : "off"}
+                {r.enabled ? "configured" : "off"}
               </span>
             </li>
           );

@@ -132,6 +132,10 @@ async function main() {
   check("re-running an audit upserts findings (no duplicates)", afterFindings === beforeFindings, `${beforeFindings} → ${afterFindings}`);
 
   /* ---------- 10. stale recovery covers audit.run ---------------------- */
+  /* Mark the previous audit as completed so the active_bucket unique index
+     doesn't block the stale audit insert (only one audit can be active at
+     a time). */
+  await db.update(audits).set({ status: "completed", finishedAt: new Date() }).where(eq(audits.id, auditId));
   const [staleAudit] = await db.insert(audits).values({
     name: `AUD-STALE-${Date.now().toString().slice(-5)}`, triggerType: "ci", status: "running",
     stages: [], environment: "local", requestedBy: "verify", startedAt: new Date(),
@@ -156,8 +160,11 @@ async function main() {
   check("its audit is marked failed, not left running", deadAudit.status === "failed", deadAudit.status);
 
   /* ---------- 11. approval decision is atomic -------------------------- */
+  /* Use the stale audit (not the main audit) for the approval test — the
+     main audit already has a pending artifact.package approval from the
+     engine finalize, and the unique partial index blocks a second one. */
   const [appr] = await db.insert(approvals).values({
-    actionType: "artifact.package", targetType: "audit", targetId: auditId,
+    actionType: "artifact.package", targetType: "audit", targetId: staleAudit.id,
     title: "verify concurrency", environment: "local", requestedBy: "verify",
   }).returning();
 

@@ -329,12 +329,26 @@ export async function decideApproval(
 
       /* Expiry check — the UPDATE matched, but was it stale? */
       if (new Date(approval.requestedAt) < cutoff) {
-        /* Revert the decision — the approval was too old to act on. */
+        /* An expired approval cannot be decided (approve or reject). Mark it
+           expired (not pending) so it can't be retried, and cancel the audit
+           it gates so the active-audit singleton index is freed. Previously
+           this reverted to "pending" but left the audit in waiting_approval
+           forever — no endpoint could cancel it, and the unique index blocked
+           every new audit. Now the audit is cancelled atomically. */
         await tx
           .update(approvals)
-          .set({ status: "pending", decidedBy: null, decidedAt: null, reason: null })
+          .set({ status: "expired", decidedBy: null, decidedAt: new Date(), reason: "auto-expired (>24h)" })
           .where(eq(approvals.id, approvalId));
-        return { ok: false as const, error: "Approval expired (>24h) — request a new one" };
+        if (approval.actionType === "audit.run" && approval.targetId) {
+          await tx.update(audits).set({ status: "cancelled", finishedAt: new Date() }).where(eq(audits.id, approval.targetId));
+        }
+        await tx.insert(events).values({
+          type: "approval.expired",
+          severity: "warning",
+          source: "system",
+          message: `Approval ${approvalId.slice(0, 8)} expired (>24h) — audit cancelled`,
+        });
+        return { ok: false as const, error: "Approval expired (>24h) — audit has been cancelled; start a new audit to retry" };
       }
 
       if (decision === "rejected") {
@@ -431,6 +445,137 @@ export async function decideApproval(
       ok: false,
       error: `Approval decision failed (rolled back, still pending): ${err instanceof Error ? err.message : String(err)}`,
     };
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Cancel an audit — frees the active-audit singleton slot.            */
+/* ------------------------------------------------------------------ */
+export async function cancelAudit(
+  auditId: string,
+  actor: Actor,
+  reason?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const result = await db.transaction(async (tx) => {
+      /* P1-2: Lock order MUST be jobs → audits (same as the finalize/error
+         paths in engine.ts, which SELECT FOR UPDATE the jobs row first).
+         Previously cancel updated audits first then jobs — a concurrent
+         finalize (jobs→audits) could deadlock with cancel (audits→jobs).
+         Now we lock the jobs row(s) first via SELECT ... FOR UPDATE, then
+         update audits, then update jobs, then approvals, then event. */
+      const jobRows = await tx
+        .select({ id: jobs.id, status: jobs.status, auditId: jobs.auditId })
+        .from(jobs)
+        .where(and(eq(jobs.auditId, auditId), inArray(jobs.status, ["queued", "running"])))
+        .for("update");
+
+      /* Only running or waiting_approval audits can be cancelled. A completed
+         or already-cancelled audit is immutable. The WHERE clause makes the
+         check + update atomic. */
+      const cancelled = await tx
+        .update(audits)
+        .set({ status: "cancelled", finishedAt: new Date() })
+        .where(and(eq(audits.id, auditId), inArray(audits.status, ["running", "waiting_approval"])))
+        .returning();
+
+      if (!cancelled.length) {
+        const [existing] = await tx.select().from(audits).where(eq(audits.id, auditId)).limit(1);
+        return {
+          ok: false as const,
+          error: existing ? `Audit is ${existing.status} — cannot cancel` : "Audit not found",
+        };
+      }
+
+      /* Cancel any pending approvals for this audit so they can't be decided
+         later (which would try to start a cancelled audit). */
+      await tx
+        .update(approvals)
+        .set({ status: "expired", decidedAt: new Date(), reason: `audit cancelled by ${actor.displayName}` })
+        .where(and(eq(approvals.targetId, auditId), eq(approvals.status, "pending")));
+
+      /* Revoke the lease AND cancel the active job so the worker cannot
+         continue. Clearing lease_token + locked_by + worker means any
+         in-flight fencedJobUpdate or assert() by the old worker will see
+         0 matching rows → LeaseLostError → abort. Without this, the worker
+         keeps its lease token and can still write artifacts/findings even
+         though the job is 'cancelled'. The jobs row(s) were locked above. */
+      if (jobRows.length) {
+        await tx
+          .update(jobs)
+          .set({
+            status: "cancelled",
+            finishedAt: new Date(),
+            errorCode: "AUDIT_CANCELLED",
+            errorMessage: "audit cancelled by operator",
+            leaseToken: null,
+            lockedBy: null,
+            worker: null,
+          })
+          .where(inArray(jobs.id, jobRows.map((j) => j.id)));
+      }
+
+      const cancelReason = reason ? ` — ${reason}` : "";
+      await tx.insert(events).values({
+        type: "audit.cancelled",
+        severity: "warning",
+        source: actor.id,
+        message: `Audit ${auditId.slice(0, 8)} cancelled by ${actor.displayName}${cancelReason}`,
+      });
+
+      return { ok: true as const };
+    });
+
+    if (!result.ok) return result;
+
+    await logAudit({
+      actor,
+      action: "audit.cancel",
+      resourceType: "audit",
+      resourceId: auditId,
+      detail: { reason },
+    });
+
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `Cancel failed (rolled back): ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+/* Expire stale pending approvals and cancel their audits. Called by the
+   supervisor/cron to prevent the approval-expiry deadlock from accumulating.
+   Returns the number of approvals expired. */
+export async function expireStaleApprovals(): Promise<number> {
+  const APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
+  const cutoff = new Date(Date.now() - APPROVAL_TTL_MS);
+
+  try {
+    const expired = await db.transaction(async (tx) => {
+      const stale = await tx
+        .update(approvals)
+        .set({ status: "expired", decidedAt: new Date(), reason: "auto-expired (>24h)" })
+        .where(and(eq(approvals.status, "pending"), sql`${approvals.requestedAt} < ${cutoff}`))
+        .returning();
+
+      for (const a of stale) {
+        if (a.actionType === "audit.run" && a.targetId) {
+          await tx.update(audits).set({ status: "cancelled", finishedAt: new Date() }).where(eq(audits.id, a.targetId));
+        }
+        await tx.insert(events).values({
+          type: "approval.expired",
+          severity: "warning",
+          source: "system",
+          message: `Approval ${a.id.slice(0, 8)} auto-expired (>24h) — audit cancelled`,
+        });
+      }
+      return stale.length;
+    });
+    return expired;
+  } catch {
+    return 0;
   }
 }
 
@@ -541,6 +686,25 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
         set: { overallStatus, score: parityScore, checks, gates: PARITY_GATES.map((g) => ({ ...g })) },
       });
 
+    /* Parity gate enforcement: if parity failed, mark the audit failed and
+       emit ONLY parity.gate.failed — no audit.completed success event.
+       Previously the engine emitted audit.completed (success) and THEN
+       flipped the audit to failed, making the event feed self-contradictory. */
+    if (overallStatus === "failed") {
+      await tx.insert(events).values({
+        type: "parity.gate.failed",
+        severity: "error",
+        source: "auditor",
+        message: `${audit?.name ?? "Audit"} — parity gate FAILED, packaging approval blocked`,
+      });
+      await tx
+        .update(jobs)
+        .set({ status: "failed", progress: 100, finishedAt: new Date(), updatedAt: new Date(), errorCode: "PARITY_GATE_FAILED", errorMessage: "parity gate failed — packaging blocked" })
+        .where(and(eq(jobs.type, "audit.run"), eq(jobs.auditId, auditId)));
+      return;
+    }
+
+    /* Only emit audit.completed when parity is passed or warning. */
     await tx.insert(events).values([
       {
         type: "audit.completed",
@@ -558,16 +722,16 @@ async function completeAudit(auditId: string, startMs: number, stages: ReturnTyp
 
     /* human-in-the-loop: packaging the reconstruction bundle needs approval.
        Inside the transaction so the demo path matches production — the audit
-       cannot end up completed with no packaging approval. */
-    await tx.insert(approvals).values({
-      actionType: "artifact.package",
-      targetType: "audit",
-      targetId: auditId,
-      title: `Package reconstruction bundle của ${audit?.name ?? "audit"} (local artifact)`,
-      environment: audit?.environment ?? "production",
-      requestedBy: "auditor-service",
-      payload: { auditId, target: "audit/recon/bundle.tar.zst" },
-    });
+       cannot end up completed with no packaging approval. Only created when
+       parity is "passed" or "warning" — a "failed" parity blocks packaging. */
+    await tx.execute(sql`
+      INSERT INTO approvals (id, action_type, target_type, target_id, title, status, environment, requested_by, payload)
+      VALUES (gen_random_uuid(), 'artifact.package', 'audit', ${auditId},
+              ${`Package reconstruction bundle của ${audit?.name ?? "audit"} (local artifact)${overallStatus === "warning" ? " [parity warning]" : ""}`},
+              'pending', ${audit?.environment ?? "production"}, 'auditor-service',
+              ${JSON.stringify({ auditId, target: "audit/recon/bundle.tar.zst", parityStatus: overallStatus })}::jsonb)
+      ON CONFLICT (action_type, target_id) WHERE status = 'pending' DO NOTHING
+    `);
 
     await tx
       .update(jobs)

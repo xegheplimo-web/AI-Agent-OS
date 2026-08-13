@@ -35,11 +35,11 @@ export async function sampleTelemetryOnce(): Promise<void> {
   const queue = Math.min(38, Math.max(6, (await lastValue("queue_depth", 23)) + (rnd(seed + 4) - 0.5) * 5));
 
   await db.insert(telemetryPoints).values([
-    { metric: "latency_p95", value: Math.round(p95 * 10) / 10 },
-    { metric: "latency_p50", value: Math.round(p50 * 10) / 10 },
-    { metric: "throughput", value: Math.round(thr) },
-    { metric: "error_rate", value: Math.round(err * 100) / 100 },
-    { metric: "queue_depth", value: Math.round(queue) },
+    { metric: "latency_p95", value: Math.round(p95 * 10) / 10, source: "synthetic" },
+    { metric: "latency_p50", value: Math.round(p50 * 10) / 10, source: "synthetic" },
+    { metric: "throughput", value: Math.round(thr), source: "synthetic" },
+    { metric: "error_rate", value: Math.round(err * 100) / 100, source: "synthetic" },
+    { metric: "queue_depth", value: Math.round(queue), source: "synthetic" },
   ]);
 
   /* keep ~2.5h of data */

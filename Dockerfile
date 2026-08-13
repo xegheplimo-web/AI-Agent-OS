@@ -29,11 +29,13 @@ COPY --from=builder --chown=agentos:agentos /app/.next/static ./.next/static
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=builder /app/src ./src
 COPY --from=builder /app/tsconfig.json ./tsconfig.json
-# drizzle-kit needs its config + package.json to read the DATABASE_URL
-# datasource. Without these the `migrate` compose service (which runs
-# `drizzle-kit push` against this image) has nothing to read and fails.
+# Migration runner needs: drizzle.config.ts + package.json (for DATABASE_URL),
+# drizzle/ directory (SQL files to apply), and scripts/migrate.ts (the runner).
+# Without drizzle/ the migrator has no SQL files to apply and fails silently.
 COPY --from=builder /app/drizzle.config.ts ./drizzle.config.ts
 COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/drizzle ./drizzle
+COPY --from=builder /app/scripts ./scripts
 
 USER agentos
 EXPOSE 3000

@@ -165,6 +165,7 @@ export async function scanFilesystem(target?: AuditTarget): Promise<ScanResult> 
 export async function scanPackages(target?: AuditTarget): Promise<ScanResult> {
   const scan = startScan("package-inventory");
   try {
+    if (target && !target.rootValid) return scan.fail(target.rootInvalidReason ?? `invalid target root`);
     const root = target?.root ?? LEGACY_ROOT;
     const pkgRaw = await readFile(path.join(root, "package.json"), "utf-8");
     const pkg = JSON.parse(pkgRaw) as {
@@ -204,47 +205,160 @@ export async function scanPackages(target?: AuditTarget): Promise<ScanResult> {
       });
     }
 
-    /* ---- transitive dependencies: walk node_modules for installed pkgs ---- */
+    /* ---- transitive dependencies: walk node_modules for installed pkgs ----
+       If node_modules is absent (e.g. auditing a repo checkout without
+       `npm install`), fall back to package-lock.json which contains the
+       full resolved dependency tree with versions and licenses. This
+       ensures SBOM coverage even when the target has no installed deps. */
     const seen = new Set(components.map((c) => c.name));
     const transitiveComponents: typeof components = [];
     const topModulesDir = path.join(root, "node_modules");
+    const hasNodeModules = existsSync(topModulesDir);
     try {
-      const walkScopes = async (base: string) => {
-        const entries = await readdir(base, { withFileTypes: true }).catch(() => []);
-        for (const e of entries) {
-          if (!e.isDirectory()) continue;
-          if (e.name.startsWith(".")) continue;
-          if (e.name.startsWith("@")) {
-            const scopeEntries = await readdir(path.join(base, e.name), { withFileTypes: true }).catch(() => []);
-            for (const se of scopeEntries) {
-              if (!se.isDirectory()) continue;
-              const scoped = `${e.name}/${se.name}`;
-              if (seen.has(scoped)) continue;
-              seen.add(scoped);
-              const pkgPath = path.join(base, e.name, se.name, "package.json");
+      if (hasNodeModules) {
+        const walkScopes = async (base: string) => {
+          const entries = await readdir(base, { withFileTypes: true }).catch(() => []);
+          for (const e of entries) {
+            if (!e.isDirectory()) continue;
+            if (e.name.startsWith(".")) continue;
+            if (e.name.startsWith("@")) {
+              const scopeEntries = await readdir(path.join(base, e.name), { withFileTypes: true }).catch(() => []);
+              for (const se of scopeEntries) {
+                if (!se.isDirectory()) continue;
+                const scoped = `${e.name}/${se.name}`;
+                if (seen.has(scoped)) continue;
+                seen.add(scoped);
+                const pkgPath = path.join(base, e.name, se.name, "package.json");
+                try {
+                  const m = JSON.parse(await readFile(pkgPath, "utf-8")) as { name?: string; version?: string; license?: string | { type?: string } };
+                  let lic = "UNKNOWN";
+                  if (typeof m.license === "string") lic = m.license;
+                  else if (m.license?.type) lic = m.license.type;
+                  transitiveComponents.push({ name: m.name ?? scoped, version: m.version ?? "0.0.0", license: lic, type: "transitive" });
+                } catch { /* not a package */ }
+              }
+            } else {
+              if (seen.has(e.name)) continue;
+              seen.add(e.name);
+              const pkgPath = path.join(base, e.name, "package.json");
               try {
                 const m = JSON.parse(await readFile(pkgPath, "utf-8")) as { name?: string; version?: string; license?: string | { type?: string } };
                 let lic = "UNKNOWN";
                 if (typeof m.license === "string") lic = m.license;
                 else if (m.license?.type) lic = m.license.type;
-                transitiveComponents.push({ name: m.name ?? scoped, version: m.version ?? "0.0.0", license: lic, type: "transitive" });
+                transitiveComponents.push({ name: m.name ?? e.name, version: m.version ?? "0.0.0", license: lic, type: "transitive" });
               } catch { /* not a package */ }
             }
-          } else {
-            if (seen.has(e.name)) continue;
-            seen.add(e.name);
-            const pkgPath = path.join(base, e.name, "package.json");
-            try {
-              const m = JSON.parse(await readFile(pkgPath, "utf-8")) as { name?: string; version?: string; license?: string | { type?: string } };
-              let lic = "UNKNOWN";
-              if (typeof m.license === "string") lic = m.license;
-              else if (m.license?.type) lic = m.license.type;
-              transitiveComponents.push({ name: m.name ?? e.name, version: m.version ?? "0.0.0", license: lic, type: "transitive" });
-            } catch { /* not a package */ }
           }
+        };
+        await walkScopes(topModulesDir);
+      } else {
+        /* Fallback: parse package-lock.json for the full resolved tree.
+           npm lockfile v3 has a `packages` object keyed by path like
+           "node_modules/foo" or "node_modules/@scope/bar". The root
+           package is keyed by "" (empty string). Each entry has `version`
+           and optionally `license` / `licenses`.
+
+           Key design decisions:
+           1. Track packages by name+version (not name-only) so that
+              multiple versions of the same package in the dependency
+              tree are all reported in the SBOM. This is critical for
+              supply-chain visibility — a vulnerability in foo@1.0.0
+              must not be hidden by foo@2.0.0 also being present.
+           2. For direct deps, pick the shallowest resolved version
+              (the top-level node_modules/<name> entry, not a nested one).
+              We compare path depth, not insertion order.
+           3. Nested paths like "node_modules/@foo/bar/node_modules/@baz/qux"
+              are correctly parsed to extract the real package name. */
+        const lockPath = path.join(root, "package-lock.json");
+        if (existsSync(lockPath)) {
+          warnings.push("node_modules absent — using package-lock.json for resolved versions");
+          const lock = JSON.parse(await readFile(lockPath, "utf-8")) as {
+            packages?: Record<string, { version?: string; license?: string | { type?: string }; licenses?: Array<{ type?: string }>; dev?: boolean; optional?: boolean; link?: boolean }>;
+          };
+          const packages = lock.packages ?? {};
+
+          /* Extract the canonical package name from a lockfile path.
+             "node_modules/foo" → "foo"
+             "node_modules/@scope/bar" → "@scope/bar"
+             "node_modules/a/node_modules/@scope/b" → "@scope/b" */
+          const extractName = (lockPath: string): string => {
+            const parts = lockPath.split("node_modules/");
+            const last = parts.at(-1)!;
+            if (last.startsWith("@")) {
+              const segs = last.split("/");
+              return segs.slice(0, 2).join("/");
+            }
+            return last.split("/")[0];
+          };
+
+          /* Count the nesting depth of a lockfile path (number of
+             "node_modules/" segments). Lower = shallower = more canonical. */
+          const pathDepth = (lockPath: string): number =>
+            (lockPath.match(/node_modules\//g) ?? []).length;
+
+          /* Build a map of canonical name → { version, license, depth }
+             for the shallowest resolution of each name. This is used to
+             update direct dependency versions (direct deps resolve to
+             the top-level entry, not a nested one). */
+          const shallowestByName = new Map<string, { version: string; license: string; depth: number }>();
+          for (const [pkgPath, meta] of Object.entries(packages)) {
+            if (!pkgPath || meta.link) continue;
+            const name = extractName(pkgPath);
+            const depth = pathDepth(pkgPath);
+            let lic = "UNKNOWN";
+            if (typeof meta.license === "string") lic = meta.license;
+            else if (meta.license?.type) lic = meta.license.type;
+            else if (meta.licenses?.[0]?.type) lic = meta.licenses[0].type;
+            const existing = shallowestByName.get(name);
+            /* Keep the shallowest entry — compare depth, not insertion order. */
+            if (!existing || depth < existing.depth) {
+              shallowestByName.set(name, { version: meta.version ?? "0.0.0", license: lic, depth });
+            }
+          }
+
+          /* Update direct dependency versions from the lockfile — replace
+             semver ranges with the shallowest resolved version. */
+          for (const comp of components) {
+            const resolved = shallowestByName.get(comp.name);
+            if (resolved) {
+              comp.version = resolved.version;
+              if (comp.license === "UNKNOWN" && resolved.license !== "UNKNOWN") {
+                comp.license = resolved.license;
+              }
+            }
+          }
+
+          /* Add ALL transitive dependencies, tracking by name+version
+             (not name-only) so multiple versions of the same package
+             are all included in the SBOM. This is critical for supply-chain
+             accuracy — if foo@1.0.0 and foo@2.0.0 both appear in the tree,
+             both must be reported. */
+          const seenNameVersion = new Set(
+            components.map((c) => `${c.name}@${c.version}`),
+          );
+          for (const [pkgPath, meta] of Object.entries(packages)) {
+            if (!pkgPath || meta.link) continue;
+            const name = extractName(pkgPath);
+            const version = meta.version ?? "0.0.0";
+            const key = `${name}@${version}`;
+            if (seenNameVersion.has(key)) continue;
+            seenNameVersion.add(key);
+            let lic = "UNKNOWN";
+            if (typeof meta.license === "string") lic = meta.license;
+            else if (meta.license?.type) lic = meta.license.type;
+            else if (meta.licenses?.[0]?.type) lic = meta.licenses[0].type;
+            transitiveComponents.push({
+              name,
+              version,
+              license: lic,
+              type: meta.dev ? "development" : "transitive",
+            });
+          }
+        } else {
+          warnings.push("no node_modules and no package-lock.json — transitive dependencies unknown");
         }
-      };
-      await walkScopes(topModulesDir);
+      }
     } catch {
       warnings.push("could not walk node_modules for transitive dependencies");
     }
@@ -336,6 +450,7 @@ const SECRET_ALLOWLIST = [/\.env\.example$/, /README\.md$/, /scanners\.ts$/, /se
 export async function scanSecrets(target?: AuditTarget): Promise<ScanResult> {
   const scan = startScan("secret-scan");
   try {
+    if (target && !target.rootValid) return scan.fail(target.rootInvalidReason ?? `invalid target root`);
     const root = target?.root ?? LEGACY_ROOT;
     const files: FileEntry[] = [];
     await walk(path.join(root, "src"), files, 0, root);
@@ -482,6 +597,7 @@ export async function scanDatabase(target?: AuditTarget): Promise<ScanResult> {
       );
 
       const indexRows = indexes.rows ?? [];
+      const tableRows = tables.rows ?? [];
       const missingIndexes = (candidates.rows ?? []).filter(
         (c) =>
           !indexRows.some(
@@ -492,15 +608,70 @@ export async function scanDatabase(target?: AuditTarget): Promise<ScanResult> {
       const warnings: string[] = [];
       if (missingIndexes.length) warnings.push(`${missingIndexes.length} hot column(s) without an index`);
 
+      /* Empty-schema false-green guard: a connection to a database with 0
+         tables in public is NOT a healthy schema — it means migrations were
+         never applied (or the wrong database was connected to). Previously
+         this returned 0 missingIndexes and the parity check read "passed".
+         Now we flag it as a warning so db_schema cannot be "passed" on an
+         empty database. */
+      if (tableRows.length === 0) {
+        warnings.push("target database has 0 tables in public schema — migrations may not have been applied");
+      }
+
+      /* Migration state: check for the drizzle migrations journal table.
+         If it exists, report the latest applied migration. If it doesn't,
+         the database was set up via db:push (schema-only, no ledger) or is
+         empty — either way, migration state is "unknown". */
+      let migrationVersion: string | null = null;
+      let migrationLedgerPresent = false;
+      try {
+        /* Drizzle's PostgreSQL migration ledger is `__drizzle_migrations` in
+           the public schema (or `drizzle.__drizzle_migrations` if a schema
+           was set). The journal columns are `id` (serial), `hash` (text),
+           `created_at` (bigint) — there is NO `version` column. Previously
+           this queried `select version, hash` which always failed with a
+           column-not-found error, so the ledger was always reported absent
+           even on a correctly migrated database. We use `id` as the version
+           surrogate (it increments with each applied migration). The `hash`
+           column confirms it's a real drizzle ledger, not a
+           coincidentally-named table. */
+        const journal = await query<{ id: number; hash: string }>(
+          `select id, hash from __drizzle_migrations order by created_at desc limit 1`,
+        );
+        if (journal.rows.length) {
+          migrationVersion = String(journal.rows[0].id);
+          migrationLedgerPresent = true;
+        }
+      } catch {
+        /* __drizzle_migrations table doesn't exist in public schema — try
+           the drizzle schema, or db:push was used (no ledger). */
+        try {
+          const journal = await query<{ id: number; hash: string }>(
+            `select id, hash from drizzle.__drizzle_migrations order by created_at desc limit 1`,
+          );
+          if (journal.rows.length) {
+            migrationVersion = String(journal.rows[0].id);
+            migrationLedgerPresent = true;
+          }
+        } catch {
+          /* neither schema has the ledger table */
+        }
+      }
+      if (!migrationLedgerPresent) {
+        warnings.push("no __drizzle_migrations table — migration ledger absent (db:push was used or DB is empty)");
+      }
+
       return scan.ok(
         {
           targetDatabase: "[redacted]",
           skipped: false,
-          tableCount: (tables.rows ?? []).length,
-          tables: (tables.rows ?? []).map((r) => ({ table: r.table_name, columns: Number(r.columns), rows: null })),
+          tableCount: tableRows.length,
+          tables: tableRows.map((r) => ({ table: r.table_name, columns: Number(r.columns), rows: null })),
           indexCount: indexRows.length,
           indexes: indexRows.map((r) => ({ table: r.tablename, index: r.indexname, definition: r.indexdef })),
           missingIndexes: missingIndexes.map((r) => ({ table: r.table_name, column: r.column_name })),
+          migrationLedgerPresent,
+          migrationVersion,
         },
         ["raw/database_inventory.json"],
         warnings,
@@ -517,6 +688,7 @@ export async function scanDatabase(target?: AuditTarget): Promise<ScanResult> {
 export async function scanRuntime(target?: AuditTarget): Promise<ScanResult> {
   const scan = startScan("runtime-inventory");
   try {
+    if (target && !target.rootValid) return scan.fail(target.rootInvalidReason ?? `invalid target root`);
     const root = target?.root ?? LEGACY_ROOT;
     const runtimeEndpoint = target?.runtimeEndpoint ?? null;
 

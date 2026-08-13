@@ -31,6 +31,16 @@ const STYLES: Record<
     tone: "border-amber/25 bg-amber/8 text-amber/80",
     icon: TriangleAlert,
   },
+  manual: {
+    label: "manual/seed data — no collector",
+    tone: "border-amber/25 bg-amber/8 text-amber/80",
+    icon: TriangleAlert,
+  },
+  stale: {
+    label: "stale data — collector may have stopped",
+    tone: "border-amber/25 bg-amber/8 text-amber/80",
+    icon: TriangleAlert,
+  },
   unavailable: {
     label: "no telemetry — collector not connected",
     tone: "border-rose/25 bg-rose/8 text-rose/80",

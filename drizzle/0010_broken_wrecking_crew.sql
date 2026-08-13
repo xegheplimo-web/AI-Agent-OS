@@ -1,0 +1,1 @@
+ALTER TABLE "telemetry_points" ADD COLUMN "source" text DEFAULT 'manual' NOT NULL;

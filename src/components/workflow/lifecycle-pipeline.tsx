@@ -18,13 +18,13 @@ import { cn } from "@/lib/utils";
 import { Panel } from "@/components/ui";
 
 const STAGES = [
-  { key: "audit", label: "Audit", sub: "Thu thập & kiểm kê toàn hệ thống", icon: ScanSearch, tone: "#37d6ff" },
-  { key: "analyze", label: "Analyze", sub: "Chuẩn hóa & phân tích đồ thị phụ thuộc", icon: PieChart, tone: "#8b5cf6" },
-  { key: "document", label: "Document", sub: "Sinh báo cáo, sơ đồ, SBOM, runbook", icon: FileText, tone: "#3187ff" },
-  { key: "build", label: "Build on clean VM", sub: "Dựng lại hệ thống trên môi trường sạch", icon: Box, tone: "#20e3a2" },
-  { key: "verify", label: "Verify", sub: "Kiểm thử & đối chiếu 100% parity", icon: ShieldCheck, tone: "#20e3a2" },
-  { key: "package", label: "Package", sub: "Đóng gói artifact, SBOM, tài liệu", icon: Package, tone: "#ffb454" },
-  { key: "push", label: "Push to GitHub", sub: "Đẩy lên repo (read-only source)", icon: GitBranch, tone: "#e9f6ff" },
+  { key: "audit", label: "Audit", sub: "Thu thập & kiểm kê toàn hệ thống", icon: ScanSearch, tone: "#37d6ff", roadmap: false },
+  { key: "analyze", label: "Analyze", sub: "Chuẩn hóa & phân tích đồ thị phụ thuộc", icon: PieChart, tone: "#8b5cf6", roadmap: false },
+  { key: "document", label: "Document", sub: "Sinh báo cáo, sơ đồ, SBOM, runbook", icon: FileText, tone: "#3187ff", roadmap: false },
+  { key: "build", label: "Build on clean VM", sub: "Dựng lại hệ thống trên môi trường sạch", icon: Box, tone: "#20e3a2", roadmap: true },
+  { key: "verify", label: "Verify", sub: "Kiểm thử & đối chiếu parity", icon: ShieldCheck, tone: "#20e3a2", roadmap: false },
+  { key: "package", label: "Package", sub: "Đóng gói artifact, SBOM, tài liệu", icon: Package, tone: "#ffb454", roadmap: false },
+  { key: "push", label: "Push to GitHub", sub: "Đẩy lên repo (read-only source)", icon: GitBranch, tone: "#e9f6ff", roadmap: true },
 ] as const;
 
 type StageState = "done" | "active" | "pending";
@@ -121,6 +121,11 @@ export function LifecyclePipeline() {
                   </div>
                 </div>
                 <p className="mt-2 line-clamp-2 text-[10.5px] leading-snug text-mute">{s.sub}</p>
+                {s.roadmap && (
+                  <span className="mt-1.5 inline-block rounded border border-amber/30 bg-amber/10 px-1.5 py-0.5 font-mono text-[7.5px] tracking-widest text-amber/80 uppercase">
+                    roadmap
+                  </span>
+                )}
                 <span className="absolute top-2 right-2 font-mono text-[9px] text-mute/60">{String(i + 1).padStart(2, "0")}</span>
               </motion.div>
               {i < STAGES.length - 1 && (

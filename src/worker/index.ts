@@ -14,7 +14,7 @@ import "dotenv/config";
 
 async function main() {
   const { pool, closeDb } = await import("../db");
-  const { advanceAuditsOnce, runClaimedAudits } = await import("../services/audit");
+  const { advanceAuditsOnce, runClaimedAudits, expireStaleApprovals } = await import("../services/audit");
   const { advanceJobsOnce, requeueStaleJobs } = await import("../services/jobs");
   const { sampleTelemetryOnce } = await import("../services/telemetry");
   const { APP_MODE, isDemoMode } = await import("../services/mode");
@@ -40,7 +40,9 @@ async function main() {
              attempt=attempt+1, updated_at=now()
        WHERE id IN (
          SELECT id FROM jobs
-          WHERE status='queued' AND attempt < max_attempts
+          WHERE status='queued'
+            AND attempt < max_attempts
+            AND locked_by IS DISTINCT FROM 'inline-demo'
           ORDER BY created_at
           FOR UPDATE SKIP LOCKED
           LIMIT 1
@@ -74,6 +76,17 @@ async function main() {
       if (beats % 12 === 0) {
         const requeued = await requeueStaleJobs();
         if (requeued) console.log(`[worker] recovered ${requeued} stale job(s)`);
+        /* Expire stale pending approvals (>24h) and cancel their audits so
+           the active-audit singleton slot is freed. Without this, an expired
+           approval permanently blocks new audits. */
+        const expired = await expireStaleApprovals();
+        if (expired) console.log(`[worker] expired ${expired} stale approval(s)`);
+        /* Clean up expired sessions so the sessions table doesn't grow
+           unbounded. */
+        const { db: dbMod } = await import("../db");
+        const { sessions } = await import("../db/schema");
+        const { lt } = await import("drizzle-orm");
+        await dbMod.delete(sessions).where(lt(sessions.expiresAt, new Date()));
       }
       /* Synthetic random-walk telemetry is a DEMO affordance only. Running it
          in production would seed the database with fabricated metrics that

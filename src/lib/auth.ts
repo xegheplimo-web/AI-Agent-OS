@@ -67,6 +67,16 @@ export function hashPassword(password: string): string {
   return `${salt}:${hash}`;
 }
 
+/** Password policy: min 10 chars, at least 1 letter and 1 digit. Used by
+ *  seed.ts and any future user-creation endpoint. Returns null if valid,
+ *  or an error message string. */
+export function validatePasswordPolicy(password: string): string | null {
+  if (password.length < 10) return "Password must be at least 10 characters";
+  if (!/[a-zA-Z]/.test(password)) return "Password must contain at least one letter";
+  if (!/\d/.test(password)) return "Password must contain at least one digit";
+  return null;
+}
+
 export function verifyPassword(password: string, stored: string): boolean {
   const [salt, hash] = stored.split(":");
   if (!salt || !hash) return false;
@@ -256,6 +266,124 @@ export function getPermissionsForRole(role: Role): Permission[] {
   return ROLE_PERMISSIONS[role] ?? [];
 }
 
+/* Parse an IPv4 address into a 32-bit unsigned integer. Returns null for
+   invalid addresses. */
+function parseIpv4(ip: string): number | null {
+  const parts = ip.trim().split(".");
+  if (parts.length !== 4) return null;
+  let result = 0;
+  for (const part of parts) {
+    const octet = Number(part);
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) return null;
+    result = (result << 8) | octet;
+  }
+  return result >>> 0; /* unsigned */
+}
+
+/* Check if an IP is within a CIDR range (e.g. "10.0.0.0/8").
+   Rejects invalid prefix lengths (>32). */
+function ipInCidr(ip: string, cidr: string): boolean {
+  const slashIdx = cidr.indexOf("/");
+  const cidrIp = slashIdx >= 0 ? cidr.slice(0, slashIdx) : cidr;
+  const prefixLen = slashIdx >= 0 ? Number.parseInt(cidr.slice(slashIdx + 1), 10) : 32;
+  if (prefixLen < 0 || prefixLen > 32) return false; /* reject /33 etc */
+  const ipInt = parseIpv4(ip);
+  const cidrInt = parseIpv4(cidrIp);
+  if (ipInt === null || cidrInt === null) return false;
+  if (prefixLen === 0) return true;
+  const mask = prefixLen >= 32 ? 0xffffffff : (0xffffffff << (32 - prefixLen)) >>> 0;
+  return (ipInt & mask) === (cidrInt & mask);
+}
+
+/* Validate that a CIDR string is well-formed (e.g. "10.0.0.0/8"). */
+function isValidCidr(cidr: string): boolean {
+  const slashIdx = cidr.indexOf("/");
+  const ip = slashIdx >= 0 ? cidr.slice(0, slashIdx) : cidr;
+  const prefix = slashIdx >= 0 ? Number.parseInt(cidr.slice(slashIdx + 1), 10) : 32;
+  return parseIpv4(ip) !== null && prefix >= 0 && prefix <= 32;
+}
+
 export function clientIp(req: Request): string | null {
-  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? req.headers.get("x-real-ip");
+  /* SECURITY MODEL — read carefully before changing this function.
+
+     Next.js App Router exposes a Web API `Request` object which does NOT
+     provide access to the underlying TCP socket peer address. This means
+     the application CANNOT directly verify which IP connected to it.
+
+     The security model relies on the REVERSE PROXY (nginx/Caddy) to:
+       1. Set `x-forwarded-for` from the actual TCP socket remote address.
+       2. OVERWRITE (not append to) any client-supplied `x-forwarded-for`
+          and `x-real-ip` headers — so a direct client cannot forge them.
+       3. Be the only path to the application (firewall blocks direct access).
+
+     `TRUSTED_PROXY_CIDR` is a comma-separated list of CIDR ranges. When set,
+     the application trusts `x-forwarded-for` from requests where the
+     `x-real-ip` header (set by the proxy from the socket) falls within the
+     configured CIDR range. This is a HEADER-BASED check, not a socket-level
+     check — it relies on the proxy overwriting `x-real-ip`.
+
+     IMPORTANT LIMITATION: If a direct client can reach the application
+     (bypassing the proxy) AND can set `x-real-ip` to an IP within the
+     trusted CIDR, they can forge `x-forwarded-for` to bypass rate limiting.
+     Mitigation: ensure the application port is NOT exposed outside the
+     proxy network (use firewall rules, Docker network isolation, or bind
+     to 127.0.0.1 only).
+
+     When TRUSTED_PROXY_CIDR is unset, NO proxy headers are trusted. All
+     direct clients share a single "unknown" rate-limit bucket — safe (no
+     bypass possible) but coarse-grained.
+
+     NOTE: This in-memory rate limiter is per-instance and resets on restart.
+     For multi-instance deployments, use a shared store (Redis) — see the
+     `cache` profile in docker-compose.yml. */
+  const trustedProxy = process.env.TRUSTED_PROXY_CIDR;
+  if (!trustedProxy) {
+    /* No trusted proxy configured — do not trust any client-supplied header. */
+    return null;
+  }
+
+  /* Validate the CIDR configuration — if it's malformed, fail safe (trust
+     nothing) rather than silently treating it as "trust everything". */
+  const cidrs = trustedProxy.split(",").map((c) => c.trim()).filter(Boolean);
+  if (cidrs.length === 0 || !cidrs.every(isValidCidr)) {
+    console.error("[auth] TRUSTED_PROXY_CIDR is malformed — failing safe (no headers trusted).");
+    return null;
+  }
+
+  /* The reverse proxy sets x-real-ip from the TCP socket. We check it
+     against the trusted CIDR. This is a HEADER check, not a socket check —
+     see the security model comment above for the limitation. */
+  const xRealIp = req.headers.get("x-real-ip");
+  if (!xRealIp) {
+    /* No x-real-ip header — either no proxy, or proxy didn't set it.
+       Don't trust x-forwarded-for without proxy confirmation. */
+    return null;
+  }
+
+  /* Validate the x-real-ip format before checking CIDR membership. */
+  const realIp = xRealIp.trim();
+  if (parseIpv4(realIp) === null) {
+    /* Invalid IP format — don't trust it. */
+    return null;
+  }
+
+  if (!cidrs.some((cidr) => ipInCidr(realIp, cidr))) {
+    /* x-real-ip not in trusted CIDR — request didn't come through our proxy. */
+    return null;
+  }
+
+  /* The proxy is trusted — take the original client IP from x-forwarded-for.
+     The leftmost entry is the original client (the proxy appends to the end).
+     Validate the extracted IP format before returning it. */
+  const xff = req.headers.get("x-forwarded-for");
+  if (xff) {
+    const clientIp = xff.split(",")[0]?.trim();
+    if (clientIp && parseIpv4(clientIp) !== null) {
+      return clientIp;
+    }
+  }
+
+  /* No valid x-forwarded-for — use x-real-ip as the client IP (the proxy
+     set it from the socket, and we validated it's from a trusted source). */
+  return realIp;
 }

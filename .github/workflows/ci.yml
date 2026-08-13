@@ -42,6 +42,17 @@ jobs:
 
       - run: npm ci
 
+      # Dependency vulnerability audit. Currently non-blocking because all
+      # 16 high-severity advisories are in `sharp` (inherited from next.js
+      # image optimization) — CVE-2026-33327/33328/35590/35591 in libvips.
+      # `npm audit fix --force` would downgrade next to 9.x (breaking).
+      # The fix is to upgrade sharp to >=0.35.0 via npm overrides once next
+      # supports it. Until then, the audit output is visible in every CI
+      # run for triage. Remove continue-on-error after the override lands.
+      - name: Dependency vulnerability audit
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
       - name: Lint
         run: npm run lint
 
@@ -64,27 +75,85 @@ jobs:
             echo "::error::No drizzle/*.sql migration files found — run 'npm run db:generate' before release." && exit 1
           fi
           # Drop all tables so migrations start from an empty schema.
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c \
+          psql "$DATABASE_URL" -c \
             "DO \$\$ DECLARE r RECORD; BEGIN FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.tablename) || ' CASCADE'; END LOOP; END \$\$;" >/dev/null
           # Apply each migration file in lexical (chronological) order.
           for f in $(find drizzle -maxdepth 1 -name '*.sql' | sort); do
             echo "Applying $f ..."
-            PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -v ON_ERROR_STOP=1 -f "$f" >/dev/null \
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" >/dev/null \
               || { echo "::error::$f failed to apply"; exit 1; }
           done
           # Sanity: a core table created by the migrations must exist.
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c "\dt public.audits" | grep -q audits \
+          psql "$DATABASE_URL" -c "\dt public.audits" | grep -q audits \
             || (echo "::error::migrations did not create the audits table" && exit 1)
           # Sanity: the active-audit singleton index exists.
-          PGPASSWORD=agent_os psql -h localhost -U agent_os -d agent_os -c "\di public.audits_active_uidx" | grep -q audits_active_uidx \
+          psql "$DATABASE_URL" -c "\di public.audits_active_uidx" | grep -q audits_active_uidx \
             || (echo "::error::migrations did not create the audits_active_uidx index" && exit 1)
           echo "All $(find drizzle -maxdepth 1 -name '*.sql' | wc -l) migration files applied successfully."
 
-      # Re-push schema after the migration verify step dropped all tables.
+      # Upgrade test: apply migrations 0000-0009 (old schema), then apply
+      # 0010 (the latest) on top. This catches ALTER TABLE failures that
+      # only appear when upgrading an existing DB (e.g. NOT NULL column
+      # added to a non-empty table, or an index that already exists).
+      - name: Verify migration upgrade (old schema → latest)
+        run: |
+          # Start fresh: drop everything
+          psql "$DATABASE_URL" -c \
+            "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+          # Apply all migrations EXCEPT the latest (0010)
+          for f in $(find drizzle -maxdepth 1 -name '*.sql' | sort | head -n -1); do
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" >/dev/null \
+              || (echo "::error::Upgrade test: migration $f failed on old schema" && exit 1)
+          done
+          # Insert a row that the latest migration might ALTER (e.g. telemetry_points)
+          psql "$DATABASE_URL" -c \
+            "INSERT INTO telemetry_points (metric, value, ts) VALUES ('latency_p95', 128.0, now());"
+          # Now apply the latest migration on top — this is the upgrade path
+          LATEST=$(find drizzle -maxdepth 1 -name '*.sql' | sort | tail -1)
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$LATEST" >/dev/null \
+            || (echo "::error::Upgrade test: latest migration $LATEST failed on existing data" && exit 1)
+          echo "Upgrade test passed: $LATEST applied on top of old schema + existing data."
+
+      # Re-push schema after the migration verify step dropped tables.
       # The migration verify intentionally destroys the schema to test the
       # .sql files from scratch; db:push restores it so seed + tests can run.
       - name: Re-push schema (after migration verify dropped tables)
         run: npm run db:push
+
+      # Test the custom migration runner (scripts/migrate.ts) on a clean DB.
+      # This verifies the runner works on PostgreSQL 17, creates the ledger,
+      # and applies all migrations. Then run it again to verify idempotency.
+      - name: Test custom migration runner (clean DB + idempotency)
+        run: |
+          # Drop all tables + drizzle schema for a truly clean start
+          psql "$DATABASE_URL" -c \
+            "DROP SCHEMA public CASCADE; CREATE SCHEMA public; DROP SCHEMA IF EXISTS drizzle CASCADE;"
+          # Run the custom migration runner — applies all SQL files + creates ledger
+          npm run db:migrate:run
+          # Verify the ledger has entries
+          psql "$DATABASE_URL" -c \
+            "SELECT count(*) AS migration_count FROM drizzle.__drizzle_migrations;" | grep -v "^-" | tail -1 | xargs -I{} echo "Ledger entries: {}"
+          # Run again — should be idempotent (0 new migrations applied)
+          OUTPUT=$(npm run db:migrate:run 2>&1)
+          echo "$OUTPUT" | grep -q "0 applied" || (echo "::error::Migration runner is not idempotent" && exit 1)
+          echo "Migration runner idempotency test passed."
+
+      # Test baseline adoption: simulate a database that was created by
+      # db:push (has tables but no ledger). The runner should detect this
+      # and mark all migrations as applied without re-running them.
+      - name: Test migration baseline adoption (db:push → migrate runner)
+        run: |
+          # Drop everything, then use db:push to create schema (no ledger)
+          psql "$DATABASE_URL" -c \
+            "DROP SCHEMA public CASCADE; CREATE SCHEMA public; DROP SCHEMA IF EXISTS drizzle CASCADE;"
+          npm run db:push
+          # Verify no ledger exists yet
+          psql "$DATABASE_URL" -c \
+            "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE schemaname='drizzle' AND tablename='__drizzle_migrations')" | grep -q "f" && echo "No ledger (expected)" || echo "Ledger exists (unexpected but ok)"
+          # Run the migration runner — should adopt baseline, not fail
+          OUTPUT=$(npm run db:migrate:run 2>&1)
+          echo "$OUTPUT" | grep -q "baseline" || (echo "::error::Baseline adoption not triggered" && exit 1)
+          echo "Baseline adoption test passed."
 
       - name: Seed demo data
         run: npm run db:seed
@@ -110,7 +179,15 @@ jobs:
         env:
           APP_MODE: production
 
-      # Verify release artifacts (lockfile, .env.example, Dockerfile, etc.)
+      # Build the worker bundle (TS→JS via esbuild) BEFORE verify:release,
+      # which checks that dist/worker/index.js exists and is importable.
+      # Without this step, clean CI checkout has no dist/ (it's gitignored)
+      # and verify:release fails.
+      - name: Build worker bundle
+        run: npm run build:worker
+
+      # Verify release artifacts (lockfile, .env.example, Dockerfile, worker
+      # bundle, migration files, etc.)
       - name: Verify release readiness
         run: npm run verify:release
 
@@ -159,3 +236,67 @@ jobs:
           done
           curl -sf http://localhost:3001/api/health > /dev/null
           docker stop aos-ci && docker rm aos-ci
+
+      # Verify docker-compose.yml parses for both profiles. Catches YAML
+      # interpolation errors (e.g. unquoted colons in error messages) and
+      # missing required env vars before they bite a real deployment.
+      - name: Verify docker compose config (both profiles)
+        env:
+          API_INTERNAL_TOKEN: ci-internal-token
+          SESSION_SECRET: ci-session-secret
+          AUDITOR_SERVICE_TOKEN: ci-auditor-token
+          WORKER_SERVICE_TOKEN: ci-worker-token
+        run: |
+          docker compose --profile demo config --quiet
+          docker compose --profile production config --quiet
+
+  # Tauri desktop build matrix — verifies the installer builds on all three
+  # platforms. This is a separate job so a Tauri build failure doesn't block
+  # the web CI. The build artifacts (installers) are not yet signed or
+  # published — this is a compile-time check only.
+  tauri-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            bundles: deb
+          - platform: windows-latest
+            bundles: nsis
+          - platform: macos-latest
+            bundles: dmg
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      # Tauri requires Rust + system deps (Linux only)
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        if: matrix.platform == 'ubuntu-latest'
+      - name: Install Linux deps
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        if: matrix.platform != 'ubuntu-latest'
+      - name: Verify tauri.conf.json is valid
+        run: npm run tauri -- info
+      - name: Build Tauri installer (${{ matrix.bundles }})
+        run: npm run tauri -- build --bundles ${{ matrix.bundles }}
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-installer-${{ matrix.bundles }}
+          path: |
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.exe
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.AppImage
+            src-tauri/target/release/bundle/**/*.deb
+          if-no-files-found: warn
+          retention-days: 7

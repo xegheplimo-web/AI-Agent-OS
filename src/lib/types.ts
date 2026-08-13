@@ -61,7 +61,7 @@ export interface SystemHealthDTO {
  *   "unavailable" — no collector and no sampler ran. `current` is null and
  *                   the charts have no data. This is the honest state for a
  *                   production deployment with no OTLP wiring. */
-export type TelemetrySource = "otlp" | "synthetic" | "unavailable";
+export type TelemetrySource = "otlp" | "synthetic" | "manual" | "stale" | "unavailable";
 
 export interface TelemetrySummaryDTO {
   source: TelemetrySource;

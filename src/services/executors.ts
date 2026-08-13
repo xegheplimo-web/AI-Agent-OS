@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { artifacts, audits, events, jobs, parityReports, settings, telemetryPoints } from "@/db/schema";
 import { computeParityScore } from "@/lib/parity";
@@ -8,6 +8,7 @@ import { DISCOVERY_SCANNERS, scannersForTarget, scanPackages } from "@/services/
 import { normalize, parityChecksFrom } from "@/services/auditor/normalize";
 import { buildInventoryJson, buildRealSbom } from "@/services/auditor/reconstruct";
 import { resolveTarget, targetProvenance } from "@/services/auditor/target";
+import { isDemoMode } from "@/services/mode";
 import type { LeaseFence } from "@/services/lease";
 import type { JobRow } from "@/db/schema";
 
@@ -121,6 +122,11 @@ export async function executeSbomExport(job: JobRow, lease?: LeaseFence): Promis
   const auditScope = job.auditId ? (await loadAuditScope(job.auditId)) : [];
   const target = resolveTarget(environment, auditScope);
 
+  /* Fail-closed: if the target root is invalid (e.g. production root not
+     configured), the SBOM would be built from the worker's own checkout —
+     a false-green. Abort instead. */
+  if (!target.rootValid) throw new Error(`SBOM export refused: ${target.rootInvalidReason ?? "invalid target root"}`);
+
   /* Run only the package-inventory scanner — cheaper than a full discovery
      pass and it is the only one feeding the SBOM. */
   const pkgResult = await scanPackages(target);
@@ -131,21 +137,46 @@ export async function executeSbomExport(job: JobRow, lease?: LeaseFence): Promis
   const auditName = job.auditId ? (await loadAuditName(job.auditId)) : "global-export";
   const sbom = buildRealSbom(auditName, inv);
 
-  /* Lease fencing: abort before the side effect if we lost ownership of the
-     job while the scanner was running. Without this, a stale worker would
-     still write its SBOM artifact after another worker already took over. */
-  await lease?.assert();
-  await upsertArtifact({
-    auditId: job.auditId ?? null,
-    kind: "sbom",
-    format: "json",
-    mimeType: "application/json",
-    title: `SBOM — CycloneDX 1.6 (${auditName})`,
-    path: job.auditId ? "/audit/exports/sbom.cyclonedx.json" : "/audit/exports/sbom.cyclonedx.json",
-    content: sbom,
-    tags: ["sbom", "supply-chain", "export"],
-    environment,
-    metadata: { job: job.id, jobType: job.type, scanner: "package-inventory" },
+  /* Lease fencing: the artifact write is inside a fencedWrite transaction
+     so the lease check (SELECT FOR UPDATE) and the upsert are atomic —
+     no TOCTOU window between assert() and the write. If the lease is lost
+     (cancel cleared it, or requeue gave the job to another worker), the
+     transaction aborts before the upsert runs. */
+  await lease?.fencedWrite(async (tx) => {
+    await tx
+      .insert(artifacts)
+      .values({
+        auditId: job.auditId ?? null,
+        kind: "sbom",
+        format: "json",
+        title: `SBOM — CycloneDX 1.6 (${auditName})`,
+        path: "/audit/exports/sbom.cyclonedx.json",
+        storageProvider: "db",
+        storageKey: "/audit/exports/sbom.cyclonedx.json",
+        mimeType: "application/json",
+        sizeBytes: Buffer.byteLength(sbom, "utf-8"),
+        sizeKb: Math.round((Buffer.byteLength(sbom, "utf-8") / 1024) * 10) / 10,
+        sha256: sha256(sbom),
+        schemaVersion: "1.0",
+        generator: "ai-system-auditor",
+        generatorVersion: GENERATOR_VERSION,
+        environment,
+        content: sbom,
+        tags: ["sbom", "supply-chain", "export"],
+        metadata: { job: job.id, jobType: job.type, scanner: "package-inventory" },
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: job.auditId ? [artifacts.auditId, artifacts.path] : [artifacts.path],
+        targetWhere: job.auditId ? undefined : sql`${artifacts.auditId} IS NULL`,
+        set: {
+          content: sbom,
+          sha256: sha256(sbom),
+          sizeBytes: Buffer.byteLength(sbom, "utf-8"),
+          sizeKb: Math.round((Buffer.byteLength(sbom, "utf-8") / 1024) * 10) / 10,
+          updatedAt: new Date(),
+        },
+      });
   });
 }
 
@@ -167,11 +198,20 @@ export async function executeParityGate(job: JobRow, lease?: LeaseFence): Promis
   }
   const inv = normalize(results);
 
-  /* p95 latency from telemetry — null when absent (no false-green). */
+  /* p95 latency from telemetry — null when absent or stale (no false-green).
+     Only "otlp" or "manual" sources count for production parity; "synthetic"
+     (demo sampler) data must not make a production parity gate pass. Data
+     older than 10 minutes is treated as absent — the collector stopped. */
+  const FRESHNESS_MS = 10 * 60 * 1000;
+  const cutoff = new Date(Date.now() - FRESHNESS_MS);
   const p95Rows = await db
     .select()
     .from(telemetryPoints)
-    .where(eq(telemetryPoints.metric, "latency_p95"))
+    .where(and(
+      eq(telemetryPoints.metric, "latency_p95"),
+      sql`${telemetryPoints.ts} > ${cutoff}`,
+      inArray(telemetryPoints.source, isDemoMode ? ["synthetic", "manual"] : ["otlp"]),
+    ))
     .orderBy(desc(telemetryPoints.ts))
     .limit(1);
   const latencyP95: number | null = p95Rows.length ? p95Rows[0].value : null;
@@ -181,43 +221,75 @@ export async function executeParityGate(job: JobRow, lease?: LeaseFence): Promis
 
   const gates = [
     { key: "secrets_scan", label: "Secrets scan", status: inv.findings.some((f) => f.category === "security" && f.severity === "critical") ? "failed" : "passed" },
-    { key: "sbom_diff", label: "SBOM generated", status: "passed" },
+    { key: "sbom_generated", label: "SBOM generated", status: "passed" },
     { key: "endpoint_authz", label: "Endpoint authorization", status: checks.find((c) => c.key === "endpoint_authz")?.status ?? "pending" },
     { key: "lockfile", label: "Deterministic install (lockfile)", status: (inv.repo as { lockFilePresent?: boolean }).lockFilePresent ? "passed" : "failed" },
   ];
 
-  /* Lease fencing before persisting the parity report — a stale worker must
-     not overwrite a report another worker already produced. */
-  await lease?.assert();
-  if (job.auditId) {
-    /* Partial unique index: parity_audit_uidx ON (audit_id) WHERE audit_id IS NOT NULL.
-       Must include targetWhere or PostgreSQL rejects the ON CONFLICT. */
-    await db
-      .insert(parityReports)
-      .values({ auditId: job.auditId, overallStatus, score, environment, checks, gates })
-      .onConflictDoUpdate({
-        target: [parityReports.auditId],
-        targetWhere: sql`${parityReports.auditId} IS NOT NULL`,
-        set: { overallStatus, score, checks, gates, environment },
-      });
-  } else {
-    /* Global parity report (no audit) — no unique constraint, insert as-is. */
-    await db.insert(parityReports).values({ overallStatus, score, environment, checks, gates });
-  }
+  /* P1-4: Compute effectiveParityStatus the same way as the audit engine —
+     a failed gate (secrets, lockfile) must escalate to "failed" even if the
+     check-based score was "passed" or "warning". Previously this executor
+     persisted `overallStatus` (from checks only) while the engine persisted
+     `effectiveParityStatus` (checks + gates), so the two parity reports
+     could disagree. */
+  const anyGateFailed = gates.some((g) => g.status === "failed");
+  const effectiveParityStatus: "passed" | "warning" | "failed" =
+    anyGateFailed ? "failed" : overallStatus;
 
-  /* Also persist the parity report as a queryable artifact. */
-  await lease?.assert();
-  await upsertArtifact({
-    auditId: job.auditId ?? null,
-    kind: "json",
-    format: "json",
-    mimeType: "application/json",
-    title: "parity_report.json",
-    path: job.auditId ? "/audit/exports/parity_report.json" : "/audit/exports/parity_report.json",
-    content: buildInventoryJson("parity_report.json", { score, overallStatus, checks, gates, latencyP95 }),
-    tags: ["parity", "gate", "export"],
-    environment,
-    metadata: { job: job.id, jobType: job.type, latencySource: latencyP95 === null ? "unavailable" : "telemetry" },
+  /* Lease fencing: both the parity report upsert and the artifact upsert
+     are inside a fencedWrite transaction. The SELECT FOR UPDATE lease
+     check locks the job row so cancel/requeue cannot clear the lease
+     between check and write. */
+  const parityJson = buildInventoryJson("parity_report.json", { score, overallStatus: effectiveParityStatus, checks, gates, latencyP95 });
+  await lease?.fencedWrite(async (tx) => {
+    if (job.auditId) {
+      await tx
+        .insert(parityReports)
+        .values({ auditId: job.auditId, overallStatus: effectiveParityStatus, score, environment, checks, gates })
+        .onConflictDoUpdate({
+          target: [parityReports.auditId],
+          targetWhere: sql`${parityReports.auditId} IS NOT NULL`,
+          set: { overallStatus: effectiveParityStatus, score, checks, gates, environment },
+        });
+    } else {
+      await tx.insert(parityReports).values({ overallStatus: effectiveParityStatus, score, environment, checks, gates });
+    }
+
+    /* Persist the parity report as a queryable artifact — same transaction. */
+    await tx
+      .insert(artifacts)
+      .values({
+        auditId: job.auditId ?? null,
+        kind: "json",
+        format: "json",
+        title: "parity_report.json",
+        path: "/audit/exports/parity_report.json",
+        storageProvider: "db",
+        storageKey: "/audit/exports/parity_report.json",
+        mimeType: "application/json",
+        sizeBytes: Buffer.byteLength(parityJson, "utf-8"),
+        sizeKb: Math.round((Buffer.byteLength(parityJson, "utf-8") / 1024) * 10) / 10,
+        sha256: sha256(parityJson),
+        schemaVersion: "1.0",
+        generator: "ai-system-auditor",
+        generatorVersion: GENERATOR_VERSION,
+        environment,
+        content: parityJson,
+        tags: ["parity", "gate", "export"],
+        metadata: { job: job.id, jobType: job.type, latencySource: latencyP95 === null ? "unavailable" : "telemetry" },
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: job.auditId ? [artifacts.auditId, artifacts.path] : [artifacts.path],
+        targetWhere: job.auditId ? undefined : sql`${artifacts.auditId} IS NULL`,
+        set: {
+          content: parityJson,
+          sha256: sha256(parityJson),
+          sizeBytes: Buffer.byteLength(parityJson, "utf-8"),
+          sizeKb: Math.round((Buffer.byteLength(parityJson, "utf-8") / 1024) * 10) / 10,
+          updatedAt: new Date(),
+        },
+      });
   });
 }
 
@@ -325,43 +397,98 @@ export async function executeArtifactPackage(job: JobRow, lease?: LeaseFence): P
      for string inputs — the checksum did not match the actual archive bytes. */
   const checksum = createHash("sha256").update(tar).digest("hex");
   const tarB64 = tar.toString("base64");
+  const checksumContent = `${checksum}  bundle.tar\n`;
 
-  /* Persist the bundle as an artifact. Correct metadata: this is a TAR
-     archive, not JSON — the previous kind/format/mimeType were all "json"
-     which misled the artifact browser. */
-  await lease?.assert();
-  await upsertArtifact({
-    auditId: job.auditId,
-    kind: "archive",
-    format: "tar",
-    mimeType: "application/x-tar",
-    title: "bundle.tar (base64) + checksum",
-    path: "/audit/exports/bundle.tar",
-    content: tarB64,
-    tags: ["bundle", "tar", "export"],
-    environment,
-    metadata: {
-      job: job.id,
-      jobType: job.type,
-      checksum,
-      fileCount: bundleable.length,
-      encoding: "base64",
-      provenance: targetProvenance(target),
-    },
-  });
+  /* Atomic bundle+checksum persist: both artifact rows are written inside a
+     single fencedWrite transaction so a crash or lease-loss between them can
+     never leave a bundle without its checksum (half-written export). The
+     SELECT FOR UPDATE lease guard is the first statement — if the lease is
+     lost, neither row is written. */
+  await lease?.fencedWrite(async (tx) => {
+    /* Bundle artifact — correct metadata: this is a TAR archive, not JSON. */
+    await tx
+      .insert(artifacts)
+      .values({
+        auditId: job.auditId,
+        kind: "archive",
+        format: "tar",
+        title: "bundle.tar (base64) + checksum",
+        path: "/audit/exports/bundle.tar",
+        storageProvider: "db",
+        storageKey: "/audit/exports/bundle.tar",
+        mimeType: "application/x-tar",
+        sizeBytes: Buffer.byteLength(tarB64, "utf-8"),
+        sizeKb: Math.round((Buffer.byteLength(tarB64, "utf-8") / 1024) * 10) / 10,
+        sha256: sha256(tarB64),
+        schemaVersion: "1.0",
+        generator: "ai-system-auditor",
+        generatorVersion: GENERATOR_VERSION,
+        environment,
+        content: tarB64,
+        tags: ["bundle", "tar", "export"],
+        metadata: {
+          job: job.id,
+          jobType: job.type,
+          checksum,
+          fileCount: bundleable.length,
+          encoding: "base64",
+          provenance: targetProvenance(target),
+        },
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [artifacts.auditId, artifacts.path],
+        set: {
+          content: tarB64,
+          sha256: sha256(tarB64),
+          sizeBytes: Buffer.byteLength(tarB64, "utf-8"),
+          sizeKb: Math.round((Buffer.byteLength(tarB64, "utf-8") / 1024) * 10) / 10,
+          metadata: {
+            job: job.id,
+            jobType: job.type,
+            checksum,
+            fileCount: bundleable.length,
+            encoding: "base64",
+            provenance: targetProvenance(target),
+          },
+          updatedAt: new Date(),
+        },
+      });
 
-  await lease?.assert();
-  await upsertArtifact({
-    auditId: job.auditId,
-    kind: "text",
-    format: "sha256",
-    mimeType: "text/plain",
-    title: "bundle.tar.sha256",
-    path: "/audit/exports/bundle.tar.sha256",
-    content: `${checksum}  bundle.tar\n`,
-    tags: ["bundle", "checksum", "export"],
-    environment,
-    metadata: { job: job.id, jobType: job.type },
+    /* Checksum artifact — same transaction so bundle+checksum are atomic. */
+    await tx
+      .insert(artifacts)
+      .values({
+        auditId: job.auditId,
+        kind: "text",
+        format: "sha256",
+        title: "bundle.tar.sha256",
+        path: "/audit/exports/bundle.tar.sha256",
+        storageProvider: "db",
+        storageKey: "/audit/exports/bundle.tar.sha256",
+        mimeType: "text/plain",
+        sizeBytes: Buffer.byteLength(checksumContent, "utf-8"),
+        sizeKb: Math.round((Buffer.byteLength(checksumContent, "utf-8") / 1024) * 10) / 10,
+        sha256: sha256(checksumContent),
+        schemaVersion: "1.0",
+        generator: "ai-system-auditor",
+        generatorVersion: GENERATOR_VERSION,
+        environment,
+        content: checksumContent,
+        tags: ["bundle", "checksum", "export"],
+        metadata: { job: job.id, jobType: job.type },
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [artifacts.auditId, artifacts.path],
+        set: {
+          content: checksumContent,
+          sha256: sha256(checksumContent),
+          sizeBytes: Buffer.byteLength(checksumContent, "utf-8"),
+          sizeKb: Math.round((Buffer.byteLength(checksumContent, "utf-8") / 1024) * 10) / 10,
+          updatedAt: new Date(),
+        },
+      });
   });
 }
 
@@ -470,51 +597,99 @@ export async function executeKnowledgeReindex(job: JobRow, lease?: LeaseFence): 
     ? await db.select().from(artifacts).where(eq(artifacts.auditId, job.auditId))
     : await db.select().from(artifacts);
 
-  /* Load existing global index to merge into (if this is a scoped reindex). */
   type IndexShape = {
     postings: Record<string, Array<{ artifactId: number; path: string; tf: number }>>;
     docLengths: Record<number, number>;
     auditDocs?: Record<string, number[]>;
   };
-  let existingIndex: IndexShape | null = null;
-  if (job.auditId) {
-    const existing = await db.select().from(settings).where(eq(settings.key, "knowledge.invertedIndex")).limit(1);
-    if (existing.length) {
-      existingIndex = existing[0].value as IndexShape;
+
+  /* P0-1 + P1-6: The entire merge + persist + manifest artifact is inside a
+     single fencedWrite transaction. The lease check (SELECT FOR UPDATE on the
+     jobs row) is the first statement — if the lease is lost, nothing is
+     written. The settings row is also locked with FOR UPDATE for BOTH global
+     and scoped reindex (previously only scoped reindex locked the settings
+     row, so two concurrent global reindex jobs could lost-update each other).
+
+     Edge case: if the settings row doesn't exist yet (first-ever reindex),
+     SELECT FOR UPDATE locks nothing — we insert a placeholder row first
+     (ON CONFLICT DO NOTHING) so the row always exists before the lock. */
+  await lease!.fencedWrite(async (tx) => {
+    /* Ensure the row exists so FOR UPDATE can lock it. */
+    await tx.execute(
+      sql`INSERT INTO settings (key, value, updated_at) VALUES ('knowledge.invertedIndex', '{}'::jsonb, NOW()) ON CONFLICT (key) DO NOTHING`,
+    );
+
+    /* P1-6: Lock the settings row for BOTH global and scoped reindex. The
+       FOR UPDATE serializes concurrent reindex jobs: the second blocks until
+       the first commits, then reads the updated index. Previously only scoped
+       reindex did this, so two concurrent global reindex jobs could both
+       read the same index, rebuild, and overwrite each other (lost update). */
+    let existingIndex: IndexShape | null = null;
+    const existing = await tx.execute(
+      sql`SELECT value FROM settings WHERE key = 'knowledge.invertedIndex' FOR UPDATE`,
+    );
+    const existingRows = (existing.rows ?? []) as Array<{ value: IndexShape }>;
+    if (existingRows.length) {
+      const val = existingRows[0].value as IndexShape;
+      /* Don't treat the placeholder '{}' as a real index. */
+      if (val && Object.keys(val).length > 0) {
+        existingIndex = val;
+      }
     }
-  }
 
-  /* Pure merge/rebuild — see buildMergedIndex. Evicts postings for the
-     audit's previous artifacts (including deleted ones) before re-inserting. */
-  const index = buildMergedIndex(existingIndex, rows, job.auditId);
+    /* Pure merge/rebuild — see buildMergedIndex. Evicts postings for the
+       audit's previous artifacts (including deleted ones) before re-inserting. */
+    const merged = buildMergedIndex(existingIndex, rows, job.auditId);
 
-  /* Lease fencing before persisting the merged index — a stale worker must
-     not overwrite the index another worker already rebuilt. */
-  await lease?.assert();
-  await db
-    .insert(settings)
-    .values({ key: "knowledge.invertedIndex", value: index })
-    .onConflictDoUpdate({ target: [settings.key], set: { value: index, updatedAt: new Date() } });
+    await tx
+      .insert(settings)
+      .values({ key: "knowledge.invertedIndex", value: merged })
+      .onConflictDoUpdate({ target: [settings.key], set: { value: merged, updatedAt: new Date() } });
 
-  /* Persist a manifest artifact so the reindex is visible in the artifact
-     browser and has a sha256 like every other export. */
-  await lease?.assert();
-  await upsertArtifact({
-    auditId: job.auditId ?? null,
-    kind: "json",
-    format: "json",
-    mimeType: "application/json",
-    title: "knowledge_index_manifest.json",
-    path: "/audit/exports/knowledge_index_manifest.json",
-    content: buildInventoryJson("knowledge_index_manifest.json", {
-      docCount: index.docCount,
-      termCount: index.termCount,
+    /* Persist the manifest artifact INSIDE the same transaction — previously
+       this was a separate assert→upsert outside the transaction, so a crash
+       or lease-loss between the index persist and the manifest could leave
+       the index updated with no manifest artifact (half-written export). */
+    const manifestJson = buildInventoryJson("knowledge_index_manifest.json", {
+      docCount: merged.docCount,
+      termCount: merged.termCount,
       lastScopedAudit: job.auditId ?? null,
-      auditDocCounts: Object.fromEntries(Object.entries(index.auditDocs).map(([k, v]) => [k, v.length])),
-    }),
-    tags: ["knowledge", "inverted-index", "export"],
-    environment,
-    metadata: { job: job.id, jobType: job.type },
+      auditDocCounts: Object.fromEntries(Object.entries(merged.auditDocs).map(([k, v]) => [k, v.length])),
+    });
+    await tx
+      .insert(artifacts)
+      .values({
+        auditId: job.auditId ?? null,
+        kind: "json",
+        format: "json",
+        title: "knowledge_index_manifest.json",
+        path: "/audit/exports/knowledge_index_manifest.json",
+        storageProvider: "db",
+        storageKey: "/audit/exports/knowledge_index_manifest.json",
+        mimeType: "application/json",
+        sizeBytes: Buffer.byteLength(manifestJson, "utf-8"),
+        sizeKb: Math.round((Buffer.byteLength(manifestJson, "utf-8") / 1024) * 10) / 10,
+        sha256: sha256(manifestJson),
+        schemaVersion: "1.0",
+        generator: "ai-system-auditor",
+        generatorVersion: GENERATOR_VERSION,
+        environment,
+        content: manifestJson,
+        tags: ["knowledge", "inverted-index", "export"],
+        metadata: { job: job.id, jobType: job.type },
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: job.auditId ? [artifacts.auditId, artifacts.path] : [artifacts.path],
+        targetWhere: job.auditId ? undefined : sql`${artifacts.auditId} IS NULL`,
+        set: {
+          content: manifestJson,
+          sha256: sha256(manifestJson),
+          sizeBytes: Buffer.byteLength(manifestJson, "utf-8"),
+          sizeKb: Math.round((Buffer.byteLength(manifestJson, "utf-8") / 1024) * 10) / 10,
+          updatedAt: new Date(),
+        },
+      });
   });
 }
 
@@ -538,10 +713,30 @@ export function hasExecutor(jobType: string): boolean {
  *  caller must mark the job failed with errorCode NO_EXECUTOR rather than
  *  silently completing it. The optional `lease` lets the executor abort
  *  (LeaseLostError) before each side effect if it lost job ownership. */
+/* Default no-op fence for executors called without a lease (verify scripts,
+   demo mode). This ensures fencedWrite still runs the callback in a
+   transaction even when no lease is provided. */
+const noopFence: LeaseFence = {
+  jobId: "",
+  leaseToken: null,
+  leaseLost: () => false,
+  assert: async () => {},
+  fencedJobUpdate: async (set) => {
+    if (!set) return 0;
+    return 1;
+  },
+  fencedWrite: async (fn) => {
+    await db.transaction(async (tx) => { await fn(tx); });
+  },
+  stop: () => {},
+};
+
 export async function runExecutor(job: JobRow, lease?: LeaseFence): Promise<void> {
   const exec = EXECUTORS[job.type];
   if (!exec) throw new Error(`NO_EXECUTOR: no executor registered for job type "${job.type}"`);
-  await exec(job, lease);
+  /* Always provide a fence so fencedWrite runs — use noopFence when no lease
+     is given (verify scripts, demo mode). */
+  await exec(job, lease ?? noopFence);
 }
 
 async function loadAuditEnvironment(auditId: string): Promise<string> {

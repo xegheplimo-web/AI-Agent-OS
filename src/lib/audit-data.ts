@@ -356,7 +356,7 @@ export const PARITY_CHECK_BASES = [
 
 export const PARITY_GATES = [
   { key: "ci_matrix", label: "CI matrix green", status: "passed" },
-  { key: "sbom_diff", label: "SBOM diff clean", status: "passed" },
+  { key: "sbom_generated", label: "SBOM generated", status: "passed" },
   { key: "secrets_scan", label: "Secrets scan", status: "warning" },
   { key: "rollback_plan", label: "Rollback plan attached", status: "passed" },
 ] as const;
