@@ -1,9 +1,8 @@
-import { desc, eq, sql, and } from "drizzle-orm";
+import { desc, eq, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { events, telemetryPoints } from "@/db/schema";
 import { ensureEventFreshIfDemo } from "@/services/audit";
 import { ensureTelemetryFresh } from "@/services/telemetry";
-import { isDemoMode } from "@/services/mode";
 import type { TelemetrySource, TelemetrySummaryDTO } from "@/lib/types";
 import { requirePermission } from "@/lib/auth";
 
@@ -63,7 +62,7 @@ export async function GET(req: Request) {
      The freshest row's source wins — a mix means the collector started
      after seed data was loaded. */
   const allRows = [...p95, ...p50, ...thr, ...err, ...queueRows.map((r) => ({ ts: r.ts.toISOString(), value: r.value, source: r.source }))];
-  const freshest = allRows.sort((a, b) => b.ts.localeCompare(a.ts))[0];
+  const freshest = allRows.toSorted((a, b) => b.ts.localeCompare(a.ts))[0];
   const freshestAge = freshest ? Date.now() - new Date(freshest.ts).getTime() : Infinity;
 
   let source: TelemetrySource;

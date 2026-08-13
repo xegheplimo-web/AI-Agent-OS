@@ -150,9 +150,9 @@ export async function executeSbomExport(job: JobRow, lease?: LeaseFence): Promis
         kind: "sbom",
         format: "json",
         title: `SBOM — CycloneDX 1.6 (${auditName})`,
-        path: job.auditId ? "/audit/exports/sbom.cyclonedx.json" : "/audit/exports/sbom.cyclonedx.json",
+        path: "/audit/exports/sbom.cyclonedx.json",
         storageProvider: "db",
-        storageKey: job.auditId ? "/audit/exports/sbom.cyclonedx.json" : "/audit/exports/sbom.cyclonedx.json",
+        storageKey: "/audit/exports/sbom.cyclonedx.json",
         mimeType: "application/json",
         sizeBytes: Buffer.byteLength(sbom, "utf-8"),
         sizeKb: Math.round((Buffer.byteLength(sbom, "utf-8") / 1024) * 10) / 10,
@@ -263,9 +263,9 @@ export async function executeParityGate(job: JobRow, lease?: LeaseFence): Promis
         kind: "json",
         format: "json",
         title: "parity_report.json",
-        path: job.auditId ? "/audit/exports/parity_report.json" : "/audit/exports/parity_report.json",
+        path: "/audit/exports/parity_report.json",
         storageProvider: "db",
-        storageKey: job.auditId ? "/audit/exports/parity_report.json" : "/audit/exports/parity_report.json",
+        storageKey: "/audit/exports/parity_report.json",
         mimeType: "application/json",
         sizeBytes: Buffer.byteLength(parityJson, "utf-8"),
         sizeKb: Math.round((Buffer.byteLength(parityJson, "utf-8") / 1024) * 10) / 10,
@@ -613,7 +613,6 @@ export async function executeKnowledgeReindex(job: JobRow, lease?: LeaseFence): 
      Edge case: if the settings row doesn't exist yet (first-ever reindex),
      SELECT FOR UPDATE locks nothing — we insert a placeholder row first
      (ON CONFLICT DO NOTHING) so the row always exists before the lock. */
-  let index: KnowledgeIndex | undefined;
   await lease!.fencedWrite(async (tx) => {
     /* Ensure the row exists so FOR UPDATE can lock it. */
     await tx.execute(
@@ -691,8 +690,6 @@ export async function executeKnowledgeReindex(job: JobRow, lease?: LeaseFence): 
           updatedAt: new Date(),
         },
       });
-
-    index = merged;
   });
 }
 

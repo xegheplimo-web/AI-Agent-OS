@@ -73,7 +73,7 @@ export function hashPassword(password: string): string {
 export function validatePasswordPolicy(password: string): string | null {
   if (password.length < 10) return "Password must be at least 10 characters";
   if (!/[a-zA-Z]/.test(password)) return "Password must contain at least one letter";
-  if (!/[0-9]/.test(password)) return "Password must contain at least one digit";
+  if (!/\d/.test(password)) return "Password must contain at least one digit";
   return null;
 }
 
@@ -285,7 +285,7 @@ function parseIpv4(ip: string): number | null {
 function ipInCidr(ip: string, cidr: string): boolean {
   const slashIdx = cidr.indexOf("/");
   const cidrIp = slashIdx >= 0 ? cidr.slice(0, slashIdx) : cidr;
-  const prefixLen = slashIdx >= 0 ? parseInt(cidr.slice(slashIdx + 1), 10) : 32;
+  const prefixLen = slashIdx >= 0 ? Number.parseInt(cidr.slice(slashIdx + 1), 10) : 32;
   if (prefixLen < 0 || prefixLen > 32) return false; /* reject /33 etc */
   const ipInt = parseIpv4(ip);
   const cidrInt = parseIpv4(cidrIp);
@@ -299,7 +299,7 @@ function ipInCidr(ip: string, cidr: string): boolean {
 function isValidCidr(cidr: string): boolean {
   const slashIdx = cidr.indexOf("/");
   const ip = slashIdx >= 0 ? cidr.slice(0, slashIdx) : cidr;
-  const prefix = slashIdx >= 0 ? parseInt(cidr.slice(slashIdx + 1), 10) : 32;
+  const prefix = slashIdx >= 0 ? Number.parseInt(cidr.slice(slashIdx + 1), 10) : 32;
   return parseIpv4(ip) !== null && prefix >= 0 && prefix <= 32;
 }
 

@@ -284,7 +284,7 @@ export async function scanPackages(target?: AuditTarget): Promise<ScanResult> {
              "node_modules/a/node_modules/@scope/b" → "@scope/b" */
           const extractName = (lockPath: string): string => {
             const parts = lockPath.split("node_modules/");
-            const last = parts[parts.length - 1];
+            const last = parts.at(-1)!;
             if (last.startsWith("@")) {
               const segs = last.split("/");
               return segs.slice(0, 2).join("/");

@@ -1,5 +1,5 @@
-import { and, desc, eq, or, sql } from "drizzle-orm";
-import { db, pool } from "@/db";
+import { and, desc, eq, sql } from "drizzle-orm";
+import { db } from "@/db";
 import { audits, events, jobs } from "@/db/schema";
 import type { Actor } from "@/lib/auth";
 import { logAudit } from "@/lib/audit-log";

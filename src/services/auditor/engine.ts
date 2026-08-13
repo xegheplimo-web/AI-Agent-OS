@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { approvals, artifacts, audits, events, findings, jobs, parityReports, telemetryPoints } from "@/db/schema";
+import { artifacts, audits, events, findings, jobs, parityReports, telemetryPoints } from "@/db/schema";
 import { computeParityScore } from "@/lib/parity";
 import { logAudit } from "@/lib/audit-log";
 import { GENERATOR_VERSION } from "@/lib/version";
@@ -719,22 +719,14 @@ export async function runRealAudit(auditId: string, jobId?: string, leaseToken?:
           jobProgress = job?.progress ?? 0;
         }
 
-        /* audit → failed (or → running for retry). Same transaction as the
-           job update so a crash between them cannot orphan either side. */
-        if (exhausted) {
-          await tx
-            .update(audits)
-            .set({ status: "failed", finishedAt: new Date(), stages })
-            .where(eq(audits.id, auditId));
-        } else {
-          /* Retryable: put audit back to running so the re-claimed job can
-             resume. Guard against requeueStaleJobs having already timed out
-             the job — if so, don't resurrect a failed audit. */
-          await tx
-            .update(audits)
-            .set({ status: "failed", finishedAt: new Date(), stages })
-            .where(eq(audits.id, auditId));
-        }
+        /* audit → failed. Same transaction as the job update so a crash
+           between them cannot orphan either side. The retry path below
+           flips it back to "running" once the job is confirmed requeueable
+           (and not already timed out by a concurrent requeue). */
+        await tx
+          .update(audits)
+          .set({ status: "failed", finishedAt: new Date(), stages })
+          .where(eq(audits.id, auditId));
 
         if (jobId) {
           /* Job update with lease filter — 0 rows means lease lost, throw to

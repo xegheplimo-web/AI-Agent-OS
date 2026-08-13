@@ -515,11 +515,12 @@ export async function cancelAudit(
           .where(inArray(jobs.id, jobRows.map((j) => j.id)));
       }
 
+      const cancelReason = reason ? ` — ${reason}` : "";
       await tx.insert(events).values({
         type: "audit.cancelled",
         severity: "warning",
         source: actor.id,
-        message: `Audit ${auditId.slice(0, 8)} cancelled by ${actor.displayName}${reason ? ` — ${reason}` : ""}`,
+        message: `Audit ${auditId.slice(0, 8)} cancelled by ${actor.displayName}${cancelReason}`,
       });
 
       return { ok: true as const };
